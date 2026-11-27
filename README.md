@@ -37,7 +37,7 @@ If the project path is very long or inside a Temp folder, set a short `CARGO_TAR
 `TrackFileAccess=false` before building (libopus is built with CMake/MSBuild).
 
 ## Status
-everything works except the messages when you send discord flagges your account working on it including the file attachment for sdending files still working on it
+everything works except the messages when you send discord flagges your account working on it including the file attachment for sending files still working on it
 
 
 
