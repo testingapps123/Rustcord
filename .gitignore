@@ -1,0 +1,9 @@
+# build output
+/target/
+*.exe
+*.pdb
+
+# local runtime files (never commit sign-in data)
+*.log
+token.txt
+settings.json
