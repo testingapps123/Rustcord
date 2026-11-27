@@ -1,5 +1,5 @@
 # Rustcord
-Rustcord
+
 Rustcord is a Discord alternative built entirely with Rust, designed to work seamlessly with Discord itself.
 
 The goal is to recreate the full Discord experience while keeping everything synchronized with Discord in real time.
