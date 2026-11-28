@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wry::{
     dpi::{LogicalPosition, LogicalSize},
-    Rect, WebContext, WebView, WebViewBuilder,
+    Rect, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows,
 };
 
 /// Discord's page removes `localStorage` from its own scripts; keep a handle before it does.
@@ -57,6 +57,7 @@ impl WebLogin {
         }
         let view = builder
             .with_background_color((49, 51, 56, 255))
+            .with_additional_browser_args(&crate::webchat::lean_args())
             .with_initialization_script(KEEP_STORAGE)
             .with_url("https://discord.com/login")
             .with_bounds(to_wry(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0))))

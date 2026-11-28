@@ -9,4 +9,6 @@ pub enum WsMessage {
     SetKeepalive(f64),
     Speaking(bool),
     Deliver(GatewayEvent),
+    /// [rustcord] send this JSON on the voice websocket (camera on/off announcements)
+    SendRaw(serde_json::Value),
 }

@@ -198,7 +198,8 @@ impl UdpRx {
                         let timestamp = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
                         let ssrc = rtp.get_ssrc();
                         let payload = rtp.payload();
-                        if let Some(media) = crate::video::take_keyframe_request() {
+                        if crate::video::take_keyframe_request(ssrc) {
+                            let media = ssrc;
                             let ours = crate::video::our_ssrc();
                             let mut header = [0u8; 8];
                             header[0] = 0x81; // V=2, FMT=1 (Picture Loss Indication)
@@ -320,7 +321,7 @@ impl UdpRx {
                 // Rustcord: a viewer asked for a full picture (PLI) for our outgoing stream.
                 {
                     let raw = rtcp.packet();
-                    if raw.len() >= 2 && raw[1] == 206 && (raw[0] & 0x1f) == 1 && crate::video::is_sending() {
+                    if raw.len() >= 2 && raw[1] == 206 && (raw[0] & 0x1f) == 1 && (crate::video::is_sending() || crate::video::camera_ready()) {
                         crate::video::keyframe_wanted();
                     }
                 }

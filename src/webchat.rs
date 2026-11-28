@@ -9,7 +9,7 @@ use eframe::egui;
 use std::path::PathBuf;
 use wry::{
     dpi::{LogicalPosition, LogicalSize},
-    MemoryUsageLevel, Rect, WebContext, WebView, WebViewBuilder, WebViewExtWindows,
+    MemoryUsageLevel, Rect, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows,
 };
 
 /// Display-only: hide Discord's own server list and channel sidebar so only the chat / call you
@@ -61,6 +61,49 @@ const CHAT_ONLY: &str = r#"(function () {
   add();
 })();"#;
 
+/// Lean WebView2: no GPU process (software drawing is plenty for a chat), one page process,
+/// V8 tuned for size, and Edge's background services off. Login uses the same settings
+/// (WebView2 requires identical settings for views sharing one profile).
+pub fn lean_args() -> String {
+    let mut a = String::from(
+        "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,Translate,OptimizationHints,MediaRouter,SpareRendererForSitePerProcess,BackForwardCache,CalculateNativeWinOcclusion \
+         --disable-gpu --disable-gpu-compositing \
+         --renderer-process-limit=1 --disable-site-isolation-trials --process-per-site \
+         --disable-background-networking --disable-component-update --disable-extensions --disable-sync --no-first-run \
+         --js-flags=--optimize-for-size",
+    );
+    match crate::net::web_proxy() {
+        Some(wry::ProxyConfig::Http(e)) => a.push_str(&format!(" --proxy-server=http://{}:{}", e.host, e.port)),
+        Some(wry::ProxyConfig::Socks5(e)) => a.push_str(&format!(" --proxy-server=socks5://{}:{}", e.host, e.port)),
+        None => {}
+    }
+    a
+}
+
+/// Is the mouse pointer over `rect` of our window? (The web view is a separate child window,
+/// so egui doesn't see the pointer there; ask Windows.)
+fn pointer_over(ctx: &egui::Context, rect: egui::Rect) -> bool {
+    use windows_sys::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+    let mut p = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut p) } == 0 {
+        return true;
+    }
+    let (inner, ppp) = ctx.input(|i| (i.viewport().inner_rect, i.pixels_per_point()));
+    let Some(inner) = inner else { return true };
+    let pos = egui::pos2(p.x as f32 / ppp - inner.min.x, p.y as f32 / ppp - inner.min.y);
+    rect.contains(pos)
+}
+
+/// Seconds since the last keyboard / mouse input anywhere.
+fn idle_secs() -> u64 {
+    use windows_sys::Win32::{System::SystemInformation::GetTickCount, UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO}};
+    let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    if unsafe { GetLastInputInfo(&mut li) } == 0 {
+        return 0;
+    }
+    (unsafe { GetTickCount() }.wrapping_sub(li.dwTime) / 1000) as u64
+}
+
 fn data_dir() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
     PathBuf::from(base).join("Rustcord").join("webchat")
@@ -96,9 +139,10 @@ pub struct WebChat {
     shown: bool,
     /// when it was last hidden (unloaded after a while to free all memory)
     hidden_since: Option<std::time::Instant>,
-    /// periodic trimming while on screen (keeps actual RAM use low)
-    last_trim: std::time::Instant,
-    trimming: bool,
+    /// last time you were using the chat
+    last_active: std::time::Instant,
+    /// in low-memory rest mode
+    resting: bool,
     /// showing a voice channel's chat (only the chat, no call view)
     voice: bool,
     voice_sent: std::time::Instant,
@@ -113,6 +157,7 @@ impl WebChat {
         }
         let view = builder
             .with_background_color((49, 51, 56, 255))
+            .with_additional_browser_args(&lean_args())
             .with_initialization_script(CHAT_ONLY)
             .with_url(url)
             .with_bounds(to_wry(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0))))
@@ -130,12 +175,12 @@ impl WebChat {
             })
             .build_as_child(frame)
             .map_err(|e| e.to_string())?;
-        Ok(Self { view, _context: context, url: url.to_string(), placed: None, shown: false, hidden_since: None, last_trim: std::time::Instant::now(), trimming: false, voice: false, voice_sent: std::time::Instant::now() })
+        Ok(Self { view, _context: context, url: url.to_string(), placed: None, shown: false, hidden_since: None, last_active: std::time::Instant::now(), resting: false, voice: false, voice_sent: std::time::Instant::now() })
     }
 
     /// Show the chat for `url` in `rect`.
     /// `in_call`: a voice channel / call may be running in the page, so never trim memory.
-    pub fn show(&mut self, rect: egui::Rect, url: &str, in_call: bool) {
+    pub fn show(&mut self, ctx: &egui::Context, rect: egui::Rect, url: &str, in_call: bool) {
         if self.url != url {
             // Move Discord's app to the channel without reloading it (like clicking a link in it).
             let path = url.strip_prefix("https://discord.com").unwrap_or(url);
@@ -152,30 +197,29 @@ impl WebChat {
             let _ = self.view.set_memory_usage_level(MemoryUsageLevel::Normal);
             let _ = self.view.set_visible(true);
             self.shown = true;
+            self.resting = false;
+            self.last_active = std::time::Instant::now();
             self.hidden_since = None;
         }
         if self.placed != Some(rect) {
             let _ = self.view.set_bounds(to_wry(rect));
             self.placed = Some(rect);
         }
-        // Every 30 s, briefly ask WebView2 to trim memory (measured: ~340 MB -> ~45 MB of RAM),
-        // then return to normal. Memory comes back only as pages are actually used again.
-        if in_call {
-            if self.trimming {
+        // Rest mode: while you aren't using the chat (pointer elsewhere and no input for 10 s),
+        // WebView2 runs in low-memory mode; it wakes the moment the pointer is back over it.
+        // New messages still arrive while resting. Never during a call running in the page.
+        let active = in_call || pointer_over(ctx, rect) && idle_secs() < 10;
+        if active {
+            self.last_active = std::time::Instant::now();
+            if self.resting {
                 let _ = self.view.set_memory_usage_level(MemoryUsageLevel::Normal);
-                self.trimming = false;
+                self.resting = false;
             }
-            self.last_trim = std::time::Instant::now();
-        } else if self.trimming && self.last_trim.elapsed() >= std::time::Duration::from_millis(400) {
-            let _ = self.view.set_memory_usage_level(MemoryUsageLevel::Normal);
-            self.trimming = false;
-        } else if !self.trimming && self.last_trim.elapsed() >= std::time::Duration::from_secs(30) {
+        } else if !self.resting && self.last_active.elapsed() >= std::time::Duration::from_secs(10) {
             let _ = self.view.set_memory_usage_level(MemoryUsageLevel::Low);
-            self.trimming = true;
-            self.last_trim = std::time::Instant::now();
+            self.resting = true;
         }
     }
-
     /// Voice channel chat mode: only the text chat fills the view.
     pub fn set_voice(&mut self, on: bool) {
         // Resent every 2 s too: a page that was still loading may have missed it.

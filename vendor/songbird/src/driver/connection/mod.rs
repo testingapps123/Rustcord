@@ -71,8 +71,11 @@ impl Connection {
         let mut ready = None;
 
         let is_stream = crate::video::is_stream_server(info.guild_id.0.get());
-        if is_stream {
-            info!("[rustcord] stream connection: identifying with video");
+        // [rustcord] Both kinds of connection say they handle video, like the official client:
+        // screen shares on stream connections, cameras on the voice connection.
+        let video_identify = true;
+        if video_identify {
+            info!("[rustcord] {} connection: identifying with video", if is_stream { "stream" } else { "voice" });
             client
                 .send_value(&serde_json::json!({ "op": 0, "d": {
                     "server_id": info.guild_id.0.get().to_string(),
@@ -80,7 +83,7 @@ impl Connection {
                     "session_id": info.session_id,
                     "token": info.token,
                     "video": true,
-                    "streams": [{ "type": "screen", "rid": "100", "quality": 100 }],
+                    "streams": [{ "type": if is_stream { "screen" } else { "video" }, "rid": "100", "quality": 100 }],
                     "max_dave_protocol_version": davey::DAVE_PROTOCOL_VERSION,
                 }}))
                 .await?;
@@ -211,7 +214,7 @@ impl Connection {
 
             let address = IpAddr::from_str(address_str).map_err(|_| Error::IllegalIp)?;
 
-            if is_stream {
+            if video_identify {
                 let mode = chosen_crypto.to_request_str();
                 client
                     .send_value(&serde_json::json!({ "op": 1, "d": {
@@ -269,6 +272,28 @@ impl Connection {
 
         let ssrc = ready.ssrc;
 
+        // [rustcord] Voice connection: our camera is off for now (video SSRC = audio + 1 when on),
+        // and ask the server to forward everyone's camera video to us.
+        if !is_stream {
+            crate::video::set_voice_ssrc(ssrc);
+            client
+                .send_value(&serde_json::json!({ "op": 12, "d": {
+                    "audio_ssrc": ssrc, "video_ssrc": 0, "rtx_ssrc": 0,
+                    "streams": [{
+                        "type": "video", "rid": "100", "ssrc": ssrc + 1, "active": false, "quality": 100,
+                        "rtx_ssrc": ssrc + 2, "max_bitrate": 2_500_000, "max_framerate": 30,
+                        "max_resolution": { "type": "fixed", "width": 1280, "height": 720 },
+                    }],
+                }}))
+                .await?;
+            client.send_value(&serde_json::json!({ "op": 15, "d": { "any": 100 } })).await?;
+            crate::video::set_voice_ws(ws_msg_tx.clone());
+            if let Ok(sock) = udp_tx.try_clone() {
+                crate::video::start_sender(sock, cipher.clone(), ssrc + 1, dave_session.clone(), dave_protocol_version.clone(), true);
+            }
+            crate::video::announce_camera(); // camera was already on (reconnect)
+        }
+
         // Rustcord: going live. Announce our video stream, then start the frame sender
         // on this connection's socket (Discord gives the video SSRC = audio SSRC + 1).
         if is_stream && crate::video::is_sending() {
@@ -288,7 +313,7 @@ impl Connection {
                 }}))
                 .await?;
             if let Ok(sock) = udp_tx.try_clone() {
-                crate::video::start_sender(sock, cipher.clone(), ssrc + 1, dave_session.clone());
+                crate::video::start_sender(sock, cipher.clone(), ssrc + 1, dave_session.clone(), dave_protocol_version.clone(), false);
             }
         }
 

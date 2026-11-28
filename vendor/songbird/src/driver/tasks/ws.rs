@@ -172,6 +172,13 @@ impl AuxNetwork {
                                 }
                             }
                         },
+                        Ok(WsMessage::SendRaw(v)) => {
+                            if !self.dont_send {
+                                if let Err(e) = self.ws_client.send_value(&v).await {
+                                    warn!("[rustcord] couldn't send on voice websocket: {e:?}");
+                                }
+                            }
+                        },
                         Ok(WsMessage::Deliver(msg)) => {
                             ws_error |= match self.process_ws(interconnect, msg).await {
                                 Err(e) => {
@@ -268,9 +275,12 @@ impl AuxNetwork {
                 )));
             },
             GatewayEvent::ClientConnect(ev) => {
-                debug!("Received discontinued ClientConnect: {:?}", ev);
+                // [rustcord] op 12: this user's camera video SSRC (0 = camera off).
+                debug!("[rustcord] video state: {:?}", ev);
+                crate::video::set_camera(ev.user_id.0, ev.video_ssrc);
             },
             GatewayEvent::ClientDisconnect(ev) => {
+                crate::video::remove_camera_user(ev.user_id.0);
                 #[cfg(feature = "receive")]
                 {
                     self.ssrc_signalling.disconnected_users.insert(ev.user_id);
@@ -283,6 +293,7 @@ impl AuxNetwork {
                 )));
             },
             GatewayEvent::ClientsConnect(ev) => {
+                info!("[rustcord] in the call: {} other user(s) connected", ev.user_ids.len());
                 self.recognized_user_ids.extend(&ev.user_ids);
             },
             GatewayEvent::HeartbeatAck(ev) => {
@@ -298,6 +309,7 @@ impl AuxNetwork {
                 }
             },
             GatewayEvent::DavePrepareTransition(ev) => {
+                info!("[rustcord] E2EE: prepare transition {} -> protocol {}", ev.transition_id, ev.protocol_version);
                 self.dave_pending_transitions
                     .insert(ev.transition_id, ev.protocol_version);
 
@@ -320,6 +332,7 @@ impl AuxNetwork {
                 self.execute_dave_transition(ev.transition_id);
             },
             GatewayEvent::DavePrepareEpoch(ev) if ev.epoch == 1 => {
+                info!("[rustcord] E2EE: new group (protocol {})", ev.protocol_version);
                 self.dave_protocol_version
                     .store(ev.protocol_version, Ordering::Relaxed);
                 match self.reinit_dave_session().await {
@@ -331,6 +344,7 @@ impl AuxNetwork {
                 }
             },
             GatewayEvent::DaveMlsExternalSender(ev) => {
+                info!("[rustcord] E2EE: got the server's external sender");
                 if let Some(ref mut dave_session) = *self.dave_session.write().unwrap() {
                     if let Err(e) = dave_session.set_external_sender(&ev.external_sender) {
                         warn!(error = ?e, "error setting MLS external sender");
@@ -338,6 +352,7 @@ impl AuxNetwork {
                 }
             },
             GatewayEvent::DaveMlsProposals(ev) => {
+                info!("[rustcord] E2EE: membership proposals ({:?})", ev.operation_type);
                 let operation_type = match ev.operation_type {
                     DaveMlsProposalsOperationType::Append => davey::ProposalsOperationType::APPEND,
                     DaveMlsProposalsOperationType::Revoke => davey::ProposalsOperationType::REVOKE,
@@ -388,6 +403,12 @@ impl AuxNetwork {
                             }))
                             .await?;
                     },
+                    // [rustcord] We already sent a new key package and are waiting to be
+                    // welcomed back: commits for the group we're not in yet are expected, not an
+                    // error. Re-initialising here again would loop forever (and break decryption).
+                    Some(Err(_)) if self.dave_session.read().unwrap().as_ref().map_or(false, |s| s.status() == davey::SessionStatus::PENDING) => {
+                        debug!("[rustcord] ignoring MLS commit while waiting for our welcome");
+                    },
                     Some(Err(e)) => {
                         warn!("MLS commit errored: {e:?}");
                         self.ws_client
@@ -408,6 +429,7 @@ impl AuxNetwork {
             },
             GatewayEvent::DaveMlsWelcome(ev) => match self.dave_process_welcome(&ev.welcome) {
                 Some(Ok(())) if ev.transition_id != 0 => {
+                    info!("[rustcord] E2EE: welcomed into the group");
                     let protocol_version = self.dave_protocol_version.load(Ordering::Relaxed);
 
                     self.dave_pending_transitions

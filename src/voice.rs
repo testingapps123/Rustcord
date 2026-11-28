@@ -208,6 +208,36 @@ pub enum VoiceUi {
     LiveEnded(String),
 }
 
+/// Sound of the screen share we're watching (48 kHz stereo), mixed into the call by the voice
+/// connection's 20 ms tick so both play together.
+static STREAM_PCM: Mutex<VecDeque<i16>> = Mutex::new(VecDeque::new());
+
+/// Collects the decoded audio of a watched stream.
+#[derive(Clone)]
+struct StreamAudio;
+
+#[async_trait]
+impl EventHandler for StreamAudio {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if let EventContext::VoiceTick(tick) = ctx {
+            let mut q = STREAM_PCM.lock().unwrap();
+            for data in tick.speaking.values() {
+                if let Some(pcm) = &data.decoded_voice {
+                    q.extend(pcm.iter().copied());
+                    break; // one streamer per connection
+                }
+            }
+            // never more than 0.2 s behind
+            let cap = 48_000 * 2 / 5;
+            if q.len() > cap {
+                let extra = q.len() - cap;
+                q.drain(..extra);
+            }
+        }
+        None
+    }
+}
+
 /// Reports when a stream connection drops.
 #[derive(Clone)]
 struct StreamHandler {
@@ -236,13 +266,19 @@ async fn connect_stream(
     token: String,
     session_id: String,
     user: &str,
+    watch: bool,
 ) -> Result<(Driver, u64), String> {
     let rtc = nz(rtc_server_id).ok_or("bad stream server id")?;
     let user_id = nz(user).ok_or("bad user id")?;
     songbird::video::add_stream_server(rtc.get());
-    // Decrypt (for the video hook) but don't decode the stream's audio.
-    let mut driver = Driver::new(Config::default().decode_mode(DecodeMode::Decrypt));
+    // Watching: decode the stream's sound too. Going live: only decrypt (nothing to hear).
+    let mode = if watch { DecodeMode::Decode(DecodeConfig::new(Channels::Stereo, SampleRate::Hz48000)) } else { DecodeMode::Decrypt };
+    let mut driver = Driver::new(Config::default().decode_mode(mode));
     driver.add_global_event(Event::Core(CoreEvent::DriverDisconnect), StreamHandler { out: out.clone(), ctx: ctx.clone() });
+    if watch {
+        STREAM_PCM.lock().unwrap().clear();
+        driver.add_global_event(Event::Core(CoreEvent::VoiceTick), StreamAudio);
+    }
     let info = ConnectionInfo {
         channel_id: ChannelId::from(rtc),
         endpoint,
@@ -574,7 +610,15 @@ impl EventHandler for Handler {
                 }
             }
             EventContext::VoiceTick(tick) => {
+                // 20 ms of the watched stream's sound, if any.
+                let stream_frame: Option<Vec<i16>> = {
+                    let mut q = STREAM_PCM.lock().unwrap();
+                    (q.len() >= 1920).then(|| q.drain(..1920).collect())
+                };
                 let mut streams = Vec::new();
+                if let Some(f) = &stream_frame {
+                    streams.push((f, None));
+                }
                 let mut talking = Vec::new();
                 {
                     let map = me.ssrc_user.lock().unwrap();
@@ -644,6 +688,8 @@ async fn run(
     let mut live_rtc: Option<String> = None;
     let mut live_server: Option<(String, String)> = None;
     let mut live_conn: Option<(Driver, u64)> = None;
+    // stops the PC-sound capture of our own stream
+    let mut live_sound: Option<Arc<AtomicBool>> = None;
     let shared = Shared {
         mic: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
         mic_level: Arc::new(AtomicU32::new(0)),
@@ -768,12 +814,18 @@ async fn run(
                     }
                     VoiceMsg::GoLive { key } => {
                         stop_stream(&mut live_conn);
+                        if let Some(s) = live_sound.take() {
+                            s.store(true, Ordering::Relaxed);
+                        }
                         live_key = Some(key);
                         live_rtc = None;
                         live_server = None;
                     }
                     VoiceMsg::StopLive => {
                         stop_stream(&mut live_conn);
+                        if let Some(s) = live_sound.take() {
+                            s.store(true, Ordering::Relaxed);
+                        }
                         live_key = None;
                         songbird::video::set_sending(false, 0, 0, 0, 0);
                     }
@@ -787,6 +839,9 @@ async fn run(
                     }
                     VoiceMsg::StreamGone(key) if live_key.as_deref() == Some(key.as_str()) => {
                         stop_stream(&mut live_conn);
+                        if let Some(s) = live_sound.take() {
+                            s.store(true, Ordering::Relaxed);
+                        }
                         live_key = None;
                         songbird::video::set_sending(false, 0, 0, 0, 0);
                         ui(&out, &ctx, VoiceUi::LiveEnded("Your stream ended".into()));
@@ -817,9 +872,16 @@ async fn run(
                     {
                         live_server = None;
                         tracing::info!("live: connecting to {ep}");
-                        match connect_stream(&out, &ctx, &rtc, ep, token, sid, &uid).await {
-                            Ok(c) => {
+                        match connect_stream(&out, &ctx, &rtc, ep, token, sid, &uid, false).await {
+                            Ok(mut c) => {
                                 tracing::info!("live: connected");
+                                // Stream sound: your PC's audio minus Rustcord's own (no echo of the call).
+                                let pcm: crate::loopback::Pcm = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+                                let stop = Arc::new(AtomicBool::new(false));
+                                crate::loopback::start(pcm.clone(), stop.clone());
+                                let input: Input = RawAdapter::new(MicSource { buf: pcm }, 48_000, 2).into();
+                                c.0.play_only_input(input);
+                                live_sound = Some(stop);
                                 live_conn = Some(c);
                                 ui(&out, &ctx, VoiceUi::LiveStarted);
                             }
@@ -840,7 +902,7 @@ async fn run(
                     {
                         stream_server = None;
                         tracing::info!("stream: connecting to {ep}");
-                        match connect_stream(&out, &ctx, &rtc, ep, token, sid, &uid).await {
+                        match connect_stream(&out, &ctx, &rtc, ep, token, sid, &uid, true).await {
                             Ok(live) => {
                                 tracing::info!("stream: connected");
                                 stream_live = Some(live);

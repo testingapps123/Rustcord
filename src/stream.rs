@@ -87,13 +87,169 @@ fn depacketize(payloads: &[Vec<u8>]) -> Option<Vec<u8>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// YUV 4:2:0 -> RGBA, skipping pixels when the picture is bigger than it's shown
+/// (`step` 2 = half size: a quarter of the work and upload), on 4 threads.
+fn to_rgba(yuv: &impl YUVSource, step: usize) -> (usize, usize, Vec<u8>) {
+    let (w, h) = yuv.dimensions();
+    let (sy, su, sv) = yuv.strides();
+    let (py, pu, pv) = (yuv.y(), yuv.u(), yuv.v());
+    let (ow, oh) = (w / step, h / step);
+    let mut out = vec![0u8; ow * oh * 4];
+    let rows_per = oh.div_ceil(4).max(1);
+    std::thread::scope(|s| {
+        for (chunk_i, chunk) in out.chunks_mut(rows_per * ow * 4).enumerate() {
+            s.spawn(move || {
+                for (r, row) in chunk.chunks_mut(ow * 4).enumerate() {
+                    let y = (chunk_i * rows_per + r) * step;
+                    for x in 0..ow {
+                        let sx = x * step;
+                        let yy = py[y * sy + sx] as i32 - 16;
+                        let u = pu[(y / 2) * su + sx / 2] as i32 - 128;
+                        let v = pv[(y / 2) * sv + sx / 2] as i32 - 128;
+                        let c = 298 * yy;
+                        let px = &mut row[x * 4..x * 4 + 4];
+                        px[0] = ((c + 409 * v + 128) >> 8).clamp(0, 255) as u8;
+                        px[1] = ((c - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
+                        px[2] = ((c + 516 * u + 128) >> 8).clamp(0, 255) as u8;
+                        px[3] = 255;
+                    }
+                }
+            });
+        }
+    });
+    (ow, oh, out)
+}
+
 /// Does this Annex-B frame contain a key frame (IDR slice)?
 fn has_idr(frame: &[u8]) -> bool {
     frame.windows(5).any(|w| w[..4] == START_CODE && (w[4] & 0x1F) == 5)
 }
 
+// ---------- cameras ----------
+
+/// Newest camera picture per user (taken by the UI).
+static CAM_FRAMES: Mutex<Option<HashMap<u64, egui::ColorImage>>> = Mutex::new(None);
+
+/// Our own camera preview (from camera.rs) goes into the same place as everyone else's.
+pub fn put_camera_frame(user: u64, img: egui::ColorImage) {
+    CAM_FRAMES.lock().unwrap().get_or_insert_with(Default::default).insert(user, img);
+}
+
+pub fn take_camera_frames() -> Vec<(u64, egui::ColorImage)> {
+    CAM_FRAMES.lock().unwrap().as_mut().map(|m| m.drain().collect()).unwrap_or_default()
+}
+
+/// One person's camera: reassemble -> DAVE decrypt -> decode -> small picture for their tile.
+struct Cam {
+    ssrc: u32,
+    user: u64,
+    decoder: Option<Decoder>,
+    have_picture: bool,
+    frame_ts: Option<u32>,
+    parts: Vec<(u16, Vec<u8>)>,
+    last_shown: Instant,
+    last_ask: Instant,
+}
+
+impl Cam {
+    fn new(ssrc: u32, user: u64) -> Self {
+        tracing::info!("camera: receiving {user}'s camera (SSRC {ssrc})");
+        songbird::video::request_keyframe(ssrc);
+        Self {
+            ssrc,
+            user,
+            decoder: Decoder::new().ok(),
+            have_picture: false,
+            frame_ts: None,
+            parts: Vec::new(),
+            last_shown: Instant::now() - Duration::from_secs(1),
+            last_ask: Instant::now(),
+        }
+    }
+
+    fn ask(&mut self) {
+        if self.last_ask.elapsed() >= Duration::from_millis(1500) {
+            songbird::video::request_keyframe(self.ssrc);
+            self.last_ask = Instant::now();
+        }
+    }
+
+    fn push(&mut self, pkt: RawVideo, ctx: &egui::Context) {
+        if pkt.payload_type != H264_PT {
+            return; // retransmissions etc.
+        }
+        if self.frame_ts != Some(pkt.timestamp) {
+            if !self.parts.is_empty() {
+                self.ask();
+            }
+            self.parts.clear();
+            self.frame_ts = Some(pkt.timestamp);
+        }
+        self.parts.push((pkt.seq, pkt.body));
+        if !pkt.marker {
+            return;
+        }
+        let first = self.parts[0].0;
+        self.parts.sort_by_key(|(seq, _)| seq.wrapping_sub(first) as i16);
+        let complete = self.parts.windows(2).all(|p| p[1].0 == p[0].0.wrapping_add(1));
+        let payloads: Vec<Vec<u8>> = self.parts.drain(..).map(|(_, b)| b).collect();
+        self.frame_ts = None;
+        let Some(frame) = complete.then(|| depacketize(&payloads)).flatten() else {
+            self.ask();
+            return;
+        };
+        let plain = if frame.ends_with(&DAVE_MAGIC) {
+            let mut guard = pkt.dave.write().unwrap();
+            let Some(session) = guard.as_mut() else { return };
+            match session.decrypt(self.user, MediaType::VIDEO, &frame) {
+                Ok(p) => p,
+                Err(_) => {
+                    self.ask();
+                    return;
+                }
+            }
+        } else {
+            frame
+        };
+        if !self.have_picture && !has_idr(&plain) {
+            self.ask();
+            return;
+        }
+        let Some(dec) = self.decoder.as_mut() else { return };
+        match dec.decode(&plain) {
+            Ok(Some(yuv)) => {
+                self.have_picture = true;
+                // Tiles are small: 15 fps and a reduced size are plenty.
+                if self.last_shown.elapsed() < Duration::from_millis(66) {
+                    return;
+                }
+                let (w, _) = yuv.dimensions();
+                let step = if w > 1280 { 4 } else if w > 640 { 2 } else { 1 };
+                let (ow, oh, rgba) = to_rgba(&yuv, step);
+                CAM_FRAMES
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(Default::default)
+                    .insert(self.user, egui::ColorImage::from_rgba_unmultiplied([ow, oh], &rgba));
+                self.last_shown = Instant::now();
+                ctx.request_repaint();
+            }
+            Ok(None) => {}
+            Err(_) => {
+                self.have_picture = false;
+                self.decoder = Decoder::new().ok();
+                self.ask();
+            }
+        }
+    }
+}
+
 struct Watch {
     ssrc: u32,
+    /// last full-picture request (throttled: each one costs the streamer a big key frame)
+    last_ask: Instant,
+    /// frames in a row that were "late" (network delay grew: adapt instead of dropping forever)
+    late_run: u32,
     decoder: Option<Decoder>,
     have_picture: bool,
     /// RTP timestamp (90 kHz) and wall time of the reference point for lateness
@@ -103,7 +259,15 @@ struct Watch {
 impl Watch {
     fn new(ssrc: u32) -> Self {
         songbird::video::request_keyframe(ssrc);
-        Self { ssrc, decoder: Decoder::new().ok(), have_picture: false, base: None }
+        Self { ssrc, last_ask: Instant::now(), late_run: 0, decoder: Decoder::new().ok(), have_picture: false, base: None }
+    }
+
+    /// Ask for a key frame, at most every 1.5 s.
+    fn ask(&mut self) {
+        if self.last_ask.elapsed() >= Duration::from_millis(1500) {
+            songbird::video::request_keyframe(self.ssrc);
+            self.last_ask = Instant::now();
+        }
     }
 
     /// Seconds this frame is behind real time.
@@ -132,12 +296,22 @@ fn run(rx: Receiver<RawVideo>, slot: FrameSlot, streamer: Streamer, ctx: egui::C
     let mut last_shown = Instant::now() - MIN_GAP;
     let mut fps_window: (Instant, u32) = (Instant::now(), 0);
     let mut last_streamer: Option<u64> = None;
+    let (mut decode_time, mut convert_time) = (Duration::ZERO, Duration::ZERO);
 
+    let mut cams: HashMap<u32, Cam> = HashMap::new();
     for pkt in rx {
+        // Camera video (voice connection) has its own decoders; the rest is the watched stream.
+        if let Some(user) = songbird::video::camera_user(pkt.ssrc) {
+            cams.retain(|ssrc, c| *ssrc == pkt.ssrc || songbird::video::camera_user(*ssrc) == Some(c.user));
+            cams.entry(pkt.ssrc).or_insert_with(|| Cam::new(pkt.ssrc, user)).push(pkt, &ctx);
+            continue;
+        }
         *pt_counts.entry(pkt.payload_type).or_default() += 1;
         if last_report.elapsed() > Duration::from_secs(5) {
             tracing::info!(
-                "stream: packets {pt_counts:?}; frames {frames}, shown {shown}, skipped (late) {skipped}, dave failures {dave_fail}, incomplete {gaps}"
+                "stream: packets {pt_counts:?}; frames {frames}, shown {shown}, skipped (late) {skipped}, dave failures {dave_fail}, incomplete {gaps}; avg decode {:.1} ms, convert {:.1} ms",
+                decode_time.as_secs_f64() * 1000.0 / frames.max(1) as f64,
+                convert_time.as_secs_f64() * 1000.0 / shown.max(1) as f64
             );
             last_report = Instant::now();
         }
@@ -170,7 +344,7 @@ fn run(rx: Receiver<RawVideo>, slot: FrameSlot, streamer: Streamer, ctx: egui::C
         if frame_ts != Some(pkt.timestamp) {
             if !parts.is_empty() {
                 gaps += 1; // previous frame never got its last packet
-                songbird::video::request_keyframe(w.ssrc);
+                w.ask();
             }
             parts.clear();
             frame_ts = Some(pkt.timestamp);
@@ -189,7 +363,7 @@ fn run(rx: Receiver<RawVideo>, slot: FrameSlot, streamer: Streamer, ctx: egui::C
         frames += 1;
         let Some(frame) = complete.then(|| depacketize(&payloads)).flatten() else {
             gaps += 1;
-            songbird::video::request_keyframe(w.ssrc);
+            w.ask();
             continue;
         };
 
@@ -208,6 +382,9 @@ fn run(rx: Receiver<RawVideo>, slot: FrameSlot, streamer: Streamer, ctx: egui::C
                     if dave_fail <= 3 {
                         tracing::warn!("stream: DAVE video decrypt failed: {e:?}");
                     }
+                    // Skip just this frame (keys settle within a moment); ask for a clean
+                    // full picture so any smearing clears up quickly.
+                    w.ask();
                     continue;
                 }
             }
@@ -217,23 +394,43 @@ fn run(rx: Receiver<RawVideo>, slot: FrameSlot, streamer: Streamer, ctx: egui::C
 
         // Until the first full picture arrives, P-frames can't be decoded: wait for a key frame.
         if !w.have_picture && !has_idr(&plain) {
-            songbird::video::request_keyframe(w.ssrc);
+            w.ask();
             continue;
         }
         let late = w.lateness(pkt.timestamp);
         let Some(dec) = w.decoder.as_mut() else { continue };
-        match dec.decode(&plain) {
+        let t0 = Instant::now();
+        let decoded = dec.decode(&plain);
+        decode_time += t0.elapsed();
+        match decoded {
             Ok(Some(yuv)) => {
                 w.have_picture = true;
                 // Decode always; only convert + show when we're keeping up.
-                if late > MAX_LATE || last_shown.elapsed() < MIN_GAP {
+                if late > MAX_LATE {
+                    w.late_run += 1;
+                    // Still late after ~half a second: the network delay simply grew.
+                    // Accept the new delay rather than dropping every frame from now on.
+                    if w.late_run >= 15 {
+                        w.base = None;
+                        w.late_run = 0;
+                    } else {
+                        skipped += 1;
+                        continue;
+                    }
+                } else {
+                    w.late_run = 0;
+                }
+                if last_shown.elapsed() < MIN_GAP {
                     skipped += 1;
                     continue;
                 }
+                // Shown in a window much smaller than 1080p+: convert at half size.
                 let (width, height) = yuv.dimensions();
-                let mut rgba = vec![0u8; width * height * 4];
-                yuv.write_rgba8(&mut rgba);
-                *slot.lock().unwrap() = Some(egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba));
+                let step = if width > 1400 { 2 } else { 1 };
+                let t1 = Instant::now();
+                let (ow, oh, rgba) = to_rgba(&yuv, step);
+                convert_time += t1.elapsed();
+                *slot.lock().unwrap() = Some(egui::ColorImage::from_rgba_unmultiplied([ow, oh], &rgba));
                 last_shown = Instant::now();
                 shown += 1;
                 fps_window.1 += 1;
@@ -251,7 +448,7 @@ fn run(rx: Receiver<RawVideo>, slot: FrameSlot, streamer: Streamer, ctx: egui::C
                 tracing::debug!("stream: decode error ({e}), asking for a key frame");
                 w.have_picture = false;
                 w.decoder = Decoder::new().ok();
-                songbird::video::request_keyframe(w.ssrc);
+                w.ask();
             }
         }
     }

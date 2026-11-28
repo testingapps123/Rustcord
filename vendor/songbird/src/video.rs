@@ -46,9 +46,54 @@ pub fn is_stream_server(id: u64) -> bool {
     STREAM_SERVERS.lock().unwrap().contains(&id)
 }
 
+// ---------- cameras (video on the voice connection) ----------
+
+/// camera video SSRC -> user id, from the voice server's op 12 messages
+static CAMERAS: Mutex<Option<std::collections::HashMap<u32, u64>>> = Mutex::new(None);
+
+pub(crate) fn set_camera(user: u64, video_ssrc: u32) {
+    let mut g = CAMERAS.lock().unwrap();
+    let m = g.get_or_insert_with(Default::default);
+    m.retain(|_, u| *u != user);
+    if video_ssrc != 0 {
+        m.insert(video_ssrc, user);
+    }
+}
+
+pub(crate) fn remove_camera_user(user: u64) {
+    if let Some(m) = CAMERAS.lock().unwrap().as_mut() {
+        m.retain(|_, u| *u != user);
+    }
+}
+
+/// Whose camera is this video SSRC? (None: it's screen-share video)
+pub fn camera_user(ssrc: u32) -> Option<u64> {
+    CAMERAS.lock().unwrap().as_ref().and_then(|m| m.get(&ssrc).copied())
+}
+
+/// Our audio SSRC on the voice connection (camera video goes out as +1).
+static VOICE_SSRC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn set_voice_ssrc(ssrc: u32) {
+    VOICE_SSRC.store(ssrc, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn voice_ssrc() -> u32 {
+    VOICE_SSRC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Does this user have their camera on?
+pub fn has_camera(user: u64) -> bool {
+    CAMERAS.lock().unwrap().as_ref().map_or(false, |m| m.values().any(|u| *u == user))
+}
+
+pub fn clear_cameras() {
+    *CAMERAS.lock().unwrap() = None;
+}
+
 static OUR_SSRC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// (media SSRC, when last sent)
-static KEYFRAME: Mutex<(Option<u32>, Option<std::time::Instant>)> = Mutex::new((None, None));
+/// media SSRC -> (wanted, when last sent)
+static KEYFRAME: Mutex<Option<std::collections::HashMap<u32, (bool, Option<std::time::Instant>)>>> = Mutex::new(None);
 
 pub(crate) fn set_our_ssrc(ssrc: u32) {
     OUR_SSRC.store(ssrc, std::sync::atomic::Ordering::Relaxed);
@@ -58,20 +103,21 @@ pub(crate) fn our_ssrc() -> u32 {
     OUR_SSRC.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Ask the streamer for a full picture (sent as RTCP PLI with the next received packet).
+/// Ask the sender of `media_ssrc` for a full picture (RTCP PLI, sent on the connection that
+/// carries that video when its next packet arrives).
 pub fn request_keyframe(media_ssrc: u32) {
-    KEYFRAME.lock().unwrap().0 = Some(media_ssrc);
+    KEYFRAME.lock().unwrap().get_or_insert_with(Default::default).entry(media_ssrc).or_insert((false, None)).0 = true;
 }
 
-/// At most one request every 700 ms.
-pub(crate) fn take_keyframe_request() -> Option<u32> {
-    let mut k = KEYFRAME.lock().unwrap();
-    let due = k.1.map_or(true, |t| t.elapsed() >= std::time::Duration::from_millis(700));
-    if due && k.0.is_some() {
-        k.1 = Some(std::time::Instant::now());
-        return k.0.take();
+/// Should a PLI for `ssrc` go out now? At most one every 700 ms per video.
+pub(crate) fn take_keyframe_request(ssrc: u32) -> bool {
+    let mut g = KEYFRAME.lock().unwrap();
+    let Some(e) = g.as_mut().and_then(|m| m.get_mut(&ssrc)) else { return false };
+    if e.0 && e.1.map_or(true, |t| t.elapsed() >= std::time::Duration::from_millis(700)) {
+        *e = (false, Some(std::time::Instant::now()));
+        return true;
     }
-    None
+    false
 }
 
 // ---------- Drover-style proxy for the voice websocket ----------
@@ -183,6 +229,8 @@ pub(crate) fn send_bitrate() -> u32 {
 
 pub(crate) fn keyframe_wanted() {
     WANT_KEYFRAME.store(true, std::sync::atomic::Ordering::Relaxed);
+    // (the request's target SSRC is encrypted, so ask both our video senders)
+    CAM_WANT_KEYFRAME.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Did a viewer ask for a full picture since we last checked?
@@ -201,6 +249,68 @@ pub fn send_frame(frame: OutFrame) -> bool {
         Some(tx) => tx.try_send(frame).is_ok(),
         None => false,
     }
+}
+
+// ---------- our camera (video on the voice connection) ----------
+
+static CAM_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CAM_FORMAT: Mutex<(u32, u32, u32, u32)> = Mutex::new((1280, 720, 30, 2_500_000));
+static CAM_OUT: Mutex<Option<std::sync::mpsc::SyncSender<OutFrame>>> = Mutex::new(None);
+static CAM_WANT_KEYFRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VOICE_WS: Mutex<Option<flume::Sender<crate::driver::tasks::message::WsMessage>>> = Mutex::new(None);
+
+pub(crate) fn set_voice_ws(tx: flume::Sender<crate::driver::tasks::message::WsMessage>) {
+    *VOICE_WS.lock().unwrap() = Some(tx);
+}
+
+/// Tell the voice server whether our camera is on (op 12), like the official client.
+pub(crate) fn announce_camera() {
+    let ssrc = voice_ssrc();
+    if ssrc == 0 {
+        return;
+    }
+    let on = CAM_ON.load(std::sync::atomic::Ordering::Relaxed);
+    let (w, h, fps, bitrate) = *CAM_FORMAT.lock().unwrap();
+    let msg = serde_json::json!({ "op": 12, "d": {
+        "audio_ssrc": ssrc,
+        "video_ssrc": if on { ssrc + 1 } else { 0 },
+        "rtx_ssrc": if on { ssrc + 2 } else { 0 },
+        "streams": [{
+            "type": "video", "rid": "100", "ssrc": ssrc + 1, "active": on, "quality": 100,
+            "rtx_ssrc": ssrc + 2, "max_bitrate": bitrate, "max_framerate": fps,
+            "max_resolution": { "type": "fixed", "width": w, "height": h },
+        }],
+    }});
+    if let Some(tx) = VOICE_WS.lock().unwrap().as_ref() {
+        let _ = tx.send(crate::driver::tasks::message::WsMessage::SendRaw(msg));
+    }
+}
+
+/// Turn our camera on/off in the call (the app also sets self_video in its voice state).
+pub fn set_camera_on(on: bool, width: u32, height: u32, fps: u32, bitrate: u32) {
+    *CAM_FORMAT.lock().unwrap() = (width, height, fps, bitrate);
+    CAM_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+    if on {
+        CAM_WANT_KEYFRAME.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    announce_camera();
+}
+
+/// Can camera frames be sent right now?
+pub fn camera_ready() -> bool {
+    CAM_ON.load(std::sync::atomic::Ordering::Relaxed) && CAM_OUT.lock().unwrap().is_some()
+}
+
+pub fn camera_send_frame(frame: OutFrame) -> bool {
+    match CAM_OUT.lock().unwrap().as_ref() {
+        Some(tx) => tx.try_send(frame).is_ok(),
+        None => false,
+    }
+}
+
+/// Did someone ask for a full picture of our camera?
+pub fn camera_take_keyframe() -> bool {
+    CAM_WANT_KEYFRAME.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Split Annex-B into NAL units (without start codes).
@@ -263,31 +373,48 @@ pub(crate) fn start_sender(
     cipher: crate::driver::crypto::Cipher,
     video_ssrc: u32,
     dave: Arc<RwLock<Option<davey::DaveSession>>>,
+    dave_version: Arc<std::sync::atomic::AtomicU16>,
+    camera: bool,
 ) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<OutFrame>(2);
-    *OUT.lock().unwrap() = Some(tx);
+    if camera {
+        *CAM_OUT.lock().unwrap() = Some(tx);
+    } else {
+        *OUT.lock().unwrap() = Some(tx);
+    }
     keyframe_wanted();
+    let label = if camera { "camera" } else { "go live" };
     std::thread::spawn(move || {
         let mut seq: u16 = rand::random();
         let mut counter: u32 = rand::random();
         let (mut frames, mut dave_skips, mut started) = (0u64, 0u64, std::time::Instant::now());
         for f in rx {
+            if started.elapsed() >= std::time::Duration::from_secs(5) {
+                tracing::info!(
+                    "[rustcord] {label}: sent {frames} frames, {dave_skips} held back (end-to-end encryption not ready: nobody else in the call yet?)"
+                );
+                frames = 0;
+                dave_skips = 0;
+                started = std::time::Instant::now();
+            }
             // DAVE end-to-end encryption of the whole frame (keeps NAL headers readable).
+            // Version 0 = the call isn't end-to-end encrypted: send as is, like the official client.
+            let e2ee = dave_version.load(std::sync::atomic::Ordering::Relaxed) != 0;
             let payload: Vec<u8> = {
                 let mut guard = dave.write().unwrap();
                 match guard.as_mut() {
-                    Some(s) if s.is_ready() => match s.encrypt(davey::MediaType::VIDEO, davey::Codec::H264, &f.annexb) {
+                    Some(s) if e2ee && s.is_ready() => match s.encrypt(davey::MediaType::VIDEO, davey::Codec::H264, &f.annexb) {
                         Ok(c) => c.into_owned(),
                         Err(_) => {
                             dave_skips += 1;
                             continue;
                         },
                     },
-                    Some(_) => {
+                    Some(_) if e2ee => {
                         dave_skips += 1; // group not ready yet
                         continue;
                     },
-                    None => f.annexb.clone(),
+                    _ => f.annexb.clone(),
                 }
             };
             let nals = split_nals(&payload);
@@ -312,14 +439,8 @@ pub(crate) fn start_sender(
                 }
             }
             frames += 1;
-            if started.elapsed() >= std::time::Duration::from_secs(5) {
-                tracing::info!("[rustcord] go live: sent {frames} frames, {dave_skips} waiting for DAVE");
-                frames = 0;
-                dave_skips = 0;
-                started = std::time::Instant::now();
-            }
         }
-        tracing::info!("[rustcord] go live: sender stopped");
+        tracing::info!("[rustcord] {label}: sender stopped");
     });
 }
 

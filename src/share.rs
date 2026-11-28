@@ -6,7 +6,7 @@
 
 use eframe::egui;
 use openh264::encoder::{BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, UsageType};
-use openh264::formats::{RgbaSliceU8, YUVBuffer};
+use openh264::formats::YUVBuffer;
 use openh264::OpenH264API;
 use songbird::video::OutFrame;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,7 +106,54 @@ fn scale_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     out
 }
 
-fn run(source: Source, w: u32, h: u32, fps: u32, preview: Preview, ctx: egui::Context, stop: Arc<AtomicBool>) -> Result<(), String> {
+/// Scale + convert RGBA straight to I420 (the encoder's input) in one pass on 4 threads.
+/// Replaces a full-size rescale plus a single-threaded colour conversion.
+fn rgba_to_i420(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
+    let xs: Vec<usize> = (0..dw).map(|x| (x * sw / dw).min(sw - 1)).collect();
+    let row_of = |y: usize| (y * sh / dh).min(sh - 1);
+    let mut out = vec![0u8; dw * dh * 3 / 2];
+    let (ybuf, uv) = out.split_at_mut(dw * dh);
+    let (ubuf, vbuf) = uv.split_at_mut((dw / 2) * (dh / 2));
+    let px = |sy: usize, sx: usize| {
+        let i = (sy * sw + sx) * 4;
+        (src[i] as i32, src[i + 1] as i32, src[i + 2] as i32)
+    };
+    let threads = 4;
+    let rows = dh.div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        for (t, ychunk) in ybuf.chunks_mut(rows * dw).enumerate() {
+            let xs = &xs;
+            s.spawn(move || {
+                for (r, row) in ychunk.chunks_mut(dw).enumerate() {
+                    let sy = row_of(t * rows + r);
+                    for (x, out) in row.iter_mut().enumerate() {
+                        let (r, g, b) = px(sy, xs[x]);
+                        *out = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+                    }
+                }
+            });
+        }
+        let (cw, ch) = (dw / 2, dh / 2);
+        let crows = ch.div_ceil(threads).max(1);
+        for (t, (uc, vc)) in ubuf.chunks_mut(crows * cw).zip(vbuf.chunks_mut(crows * cw)).enumerate() {
+            let xs = &xs;
+            s.spawn(move || {
+                for (r, (urow, vrow)) in uc.chunks_mut(cw).zip(vc.chunks_mut(cw)).enumerate() {
+                    let sy = row_of((t * crows + r) * 2);
+                    for x in 0..cw {
+                        let (r, g, b) = px(sy, xs[x * 2]);
+                        urow[x] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+                        vrow[x] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
+fn make_encoder(w: u32, h: u32, fps: u32) -> Result<Encoder, String> {
     let cfg = EncoderConfig::new()
         .usage_type(UsageType::ScreenContentRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
@@ -117,7 +164,12 @@ fn run(source: Source, w: u32, h: u32, fps: u32, preview: Preview, ctx: egui::Co
         // Use several CPU cores and the fastest preset so encoding keeps up in real time.
         .num_threads(4)
         .complexity(Complexity::Low);
-    let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), cfg).map_err(|e| e.to_string())?;
+    Encoder::with_api_config(OpenH264API::from_source(), cfg).map_err(|e| e.to_string())
+}
+
+fn run(source: Source, w: u32, h: u32, fps: u32, preview: Preview, ctx: egui::Context, stop: Arc<AtomicBool>) -> Result<(), String> {
+    let (mut w, mut h, mut fps) = (w, h, fps);
+    let mut encoder = make_encoder(w, h, fps)?;
 
     // Capture setup.
     let mut recorder = None;
@@ -137,13 +189,14 @@ fn run(source: Source, w: u32, h: u32, fps: u32, preview: Preview, ctx: egui::Co
     }
     tracing::info!("share: capturing at {w}x{h} {fps}fps");
 
-    let frame_gap = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+    let mut frame_gap = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let started = Instant::now();
     let mut last_preview = Instant::now() - Duration::from_secs(1);
     let mut last = Instant::now() - frame_gap;
     let mut last_rgba: Option<(u32, u32, Vec<u8>)> = None;
     let mut stats: (u32, f64) = (0, 0.0);
     let mut stats_since = Instant::now();
+    let mut slow_windows = 0u32;
     while !stop.load(Ordering::Relaxed) {
         // Grab the newest picture.
         let grabbed = if let Some(rx) = &frames_rx {
@@ -170,13 +223,10 @@ fn run(source: Source, w: u32, h: u32, fps: u32, preview: Preview, ctx: egui::Co
             std::thread::sleep(wait);
         }
         last = Instant::now();
-        let scaled = scale_rgba(&rgba, sw, sh, w, h);
-        last_rgba = Some((sw, sh, rgba));
-
         if last_preview.elapsed() >= Duration::from_millis(250) {
             let pw = 320u32;
-            let ph = (pw as u64 * h as u64 / w.max(1) as u64).max(2) as u32;
-            let small = scale_rgba(&scaled, w, h, pw, ph);
+            let ph = (pw as u64 * sh as u64 / sw.max(1) as u64).max(2) as u32;
+            let small = scale_rgba(&rgba, sw, sh, pw, ph);
             *preview.lock().unwrap() = Some(egui::ColorImage::from_rgba_unmultiplied([pw as usize, ph as usize], &small));
             ctx.request_repaint();
             last_preview = Instant::now();
@@ -188,18 +238,35 @@ fn run(source: Source, w: u32, h: u32, fps: u32, preview: Preview, ctx: egui::Co
             encoder.force_intra_frame();
         }
         let t_enc = Instant::now();
-        let yuv = YUVBuffer::from_rgb_source(RgbaSliceU8::new(&scaled, (w as usize, h as usize)));
+        let yuv = YUVBuffer::from_vec(rgba_to_i420(&rgba, sw, sh, w, h), w as usize, h as usize);
+        last_rgba = Some((sw, sh, rgba));
         let encoded = encoder.encode(&yuv).map(|bs| bs.to_vec());
         stats.0 += 1;
         stats.1 += t_enc.elapsed().as_secs_f64() * 1000.0;
         if stats_since.elapsed() >= Duration::from_secs(5) {
             let secs = stats_since.elapsed().as_secs_f64();
-            tracing::info!(
-                "share: {:.1} fps encoded, {:.1} ms per frame to encode (budget {:.1} ms)",
-                stats.0 as f64 / secs,
-                stats.1 / stats.0.max(1) as f64,
-                1000.0 / fps.max(1) as f64
-            );
+            let per = stats.1 / stats.0.max(1) as f64;
+            let budget = 1000.0 / fps.max(1) as f64;
+            tracing::info!("share: {:.1} fps encoded at {w}x{h}, {per:.1} ms per frame (budget {budget:.1} ms)", stats.0 as f64 / secs);
+            // Can't keep up for 10 s in a row: step down (60 -> 30 fps, then 1080p -> 720p -> 480p)
+            // instead of stuttering. One slow moment (a busy game scene) isn't enough.
+            slow_windows = if per > budget * 1.15 { slow_windows + 1 } else { 0 };
+            if slow_windows >= 2 {
+                slow_windows = 0;
+                let before = (w, h, fps);
+                if fps > 30 {
+                    fps = 30;
+                } else if h > 720 {
+                    (w, h) = target_size(w, h, 720);
+                } else if h > 480 {
+                    (w, h) = target_size(w, h, 480);
+                }
+                if (w, h, fps) != before {
+                    tracing::info!("share: PC too slow for {}x{}@{}, switching to {w}x{h}@{fps}", before.0, before.1, before.2);
+                    encoder = make_encoder(w, h, fps)?;
+                    frame_gap = Duration::from_secs_f64(1.0 / fps as f64);
+                }
+            }
             stats = (0, 0.0);
             stats_since = Instant::now();
         }

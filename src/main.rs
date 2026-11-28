@@ -7,7 +7,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[allow(dead_code)]
+mod camera;
 mod login;
+mod loopback;
 mod fonts;
 mod net;
 #[allow(dead_code)]
@@ -65,6 +67,10 @@ struct Chan {
     kind: u64, // 0 text, 2 voice, 4 category, 5 announcement, 13 stage
     position: i64,
     parent: Option<String>,
+    /// voice: most people allowed in (0 = no limit)
+    limit: u64,
+    /// we may join even when it's full (Move Members / admin)
+    bypass_limit: bool,
 }
 
 impl Chan {
@@ -477,11 +483,11 @@ fn base_perms(g: &Value, me: &str, my_roles: Option<&[String]>) -> Option<u64> {
     Some(if p & 0x8 != 0 { u64::MAX } else { p })
 }
 
-fn can_view(c: &Value, gid: &str, me: &str, my_roles: &[String], base: u64) -> bool {
+/// Our permissions in channel `c` (Discord's overwrite order: @everyone, roles, member).
+fn chan_perms(c: &Value, gid: &str, me: &str, my_roles: &[String], base: u64) -> u64 {
     if base == u64::MAX {
-        return true;
+        return u64::MAX;
     }
-    const VIEW: u64 = 1 << 10;
     let ows = arr(&c["permission_overwrites"]);
     let is_member = |o: &Value| o["type"].as_u64() == Some(1) || o["type"].as_str() == Some("member");
     let mut p = base;
@@ -500,7 +506,7 @@ fn can_view(c: &Value, gid: &str, me: &str, my_roles: &[String], base: u64) -> b
         p &= !perm_bits(&o["deny"]);
         p |= perm_bits(&o["allow"]);
     }
-    p & VIEW != 0
+    p
 }
 
 fn parse_guild(g: &Value, me: &str, my_roles: Option<&[String]>) -> Option<Guild> {
@@ -523,12 +529,12 @@ fn parse_guild(g: &Value, me: &str, my_roles: Option<&[String]>) -> Option<Guild
                 return None;
             }
             // Hidden channels (no View Channel permission) aren't listed, like in Discord.
-            if kind != 4 {
-                if let (Some(b), Some(r)) = (base, my_roles) {
-                    if !can_view(c, &gid_s, me, r, b) {
-                        return None;
-                    }
-                }
+            let perms = match (base, my_roles) {
+                (Some(b), Some(r)) => chan_perms(c, &gid_s, me, r, b),
+                _ => u64::MAX, // roles unknown: show everything
+            };
+            if kind != 4 && perms & (1 << 10) == 0 {
+                return None;
             }
             Some(Chan {
                 id: s(c, "id"),
@@ -536,6 +542,8 @@ fn parse_guild(g: &Value, me: &str, my_roles: Option<&[String]>) -> Option<Guild
                 kind,
                 position: c["position"].as_i64().unwrap_or(0),
                 parent: c["parent_id"].as_str().map(String::from),
+                limit: c["user_limit"].as_u64().unwrap_or(0),
+                bypass_limit: perms & (1 << 24) != 0,
             })
         })
         .collect();
@@ -1092,6 +1100,7 @@ enum VAction {
     Leave,
     ToggleMute,
     ToggleDeaf,
+    ToggleCamera,
     /// stream key, streamer user id, streamer name
     Watch(String, String, String),
     StopWatch,
@@ -1375,6 +1384,51 @@ fn mention_badge(p: &egui::Painter, at: egui::Pos2, count: u32) {
     p.galley(r.center() - g.size() / 2.0, g, Color32::WHITE);
 }
 
+/// Twemoji picture for an emoji (the same artwork Discord uses), cached by egui after first load.
+fn twemoji_url(e: &str) -> String {
+    let zwj = e.contains('\u{200D}');
+    let cps: Vec<String> = e.chars().filter(|c| zwj || *c != '\u{FE0F}').map(|c| format!("{:x}", c as u32)).collect();
+    format!("https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/{}.png", cps.join("-"))
+}
+
+/// Draw one line of text with colour emoji pictures, starting at `start` (left edge, vertical
+/// centre), clipped to `max_w`. Returns the width used.
+fn paint_rich(ui: &egui::Ui, painter: &egui::Painter, start: egui::Pos2, text: &str, size: f32, color: Color32, max_w: f32) -> f32 {
+    use unicode_segmentation::UnicodeSegmentation;
+    let end = start.x + max_w;
+    let clip = painter.with_clip_rect(Rect::from_x_y_ranges(start.x..=end, (start.y - size)..=(start.y + size)).intersect(painter.clip_rect()));
+    let mut x = start.x;
+    let mut run = String::new();
+    let flush = |run: &mut String, x: &mut f32| {
+        if run.is_empty() {
+            return;
+        }
+        let g = clip.layout_no_wrap(std::mem::take(run), FontId::proportional(size), color);
+        let w = g.size().x;
+        clip.galley(egui::pos2(*x, start.y - g.size().y / 2.0), g, color);
+        *x += w;
+    };
+    for g in text.graphemes(true) {
+        match emojis::get(g).filter(|_| !g.is_ascii()) {
+            Some(e) => {
+                flush(&mut run, &mut x);
+                let s = (size * 1.15).round();
+                if x + s > end {
+                    break;
+                }
+                // (an empty clip rect means "only measure")
+                if clip.clip_rect().is_positive() {
+                    egui::Image::new(twemoji_url(e.as_str())).paint_at(ui, Rect::from_min_size(egui::pos2(x, start.y - s / 2.0), Vec2::splat(s)));
+                }
+                x += s + 2.0;
+            }
+            None => run.push_str(g),
+        }
+    }
+    flush(&mut run, &mut x);
+    x - start.x
+}
+
 fn list_row(ui: &mut egui::Ui, selected: bool, unread: bool, badge: u32, icon: Option<&str>, prefix: &str, name: &str) -> bool {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, if icon.is_some() { 42.0 } else { 32.0 }), Sense::click());
@@ -1394,9 +1448,7 @@ fn list_row(ui: &mut egui::Ui, selected: bool, unread: bool, badge: u32, icon: O
         x += 22.0;
     }
     let color = if selected || unread { BRIGHT } else { MUTED };
-    let font = FontId::proportional(15.0);
-    let galley = painter.layout(name.to_string(), font, color, rect.right() - x - 8.0);
-    painter.galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, color);
+    paint_rich(ui, &painter, egui::pos2(x, rect.center().y), name, 15.0, color, rect.right() - x - 8.0);
     mention_badge(&painter, egui::pos2(rect.right() - 14.0, rect.center().y + 9.0), badge);
     if unread && !selected {
         painter.circle_filled(egui::pos2(rect.left() - 2.0, rect.center().y), 4.0, BRIGHT);
@@ -1513,6 +1565,14 @@ struct App {
     stream_note: String,
     frame_slot: stream::FrameSlot,
     stream_tex: Option<egui::TextureHandle>,
+    /// user id -> their camera picture
+    cam_tex: HashMap<String, egui::TextureHandle>,
+    /// our webcam while it's on in a call
+    camera: Option<camera::Camera>,
+    /// for background threads (camera) to wake the UI
+    ctx: egui::Context,
+    /// set by the camera thread if the webcam couldn't start / stopped
+    camera_err: Arc<std::sync::Mutex<Option<String>>>,
     /// channel -> (user id, name, when they started typing)
     typing: HashMap<String, Vec<(String, String, Instant)>>,
     /// guild -> member list rows (Discord's sidebar list)
@@ -1743,6 +1803,10 @@ impl App {
             stream_note: String::new(),
             frame_slot,
             stream_tex: None,
+            cam_tex: HashMap::new(),
+            camera: None,
+            camera_err: Arc::new(std::sync::Mutex::new(None)),
+            ctx: cc.egui_ctx.clone(),
             typing: HashMap::new(),
             member_lists: HashMap::new(),
             show_members: true,
@@ -2204,12 +2268,34 @@ impl App {
     }
 
     /// Tell Discord our voice state (join / move / leave / mute / deafen).
+    /// Webcam on/off in the current call.
+    fn set_camera(&mut self, on: bool) {
+        if on == self.camera.is_some() {
+            return;
+        }
+        if on {
+            let me = self.me_id.parse::<u64>().unwrap_or(0);
+            let slot = self.camera_err.clone();
+            let ctx = self.ctx.clone();
+            let ctx2 = ctx.clone();
+            self.camera = Some(camera::start(me, ctx, move |e| {
+                *slot.lock().unwrap() = Some(e);
+                ctx2.request_repaint();
+            }));
+            songbird::video::set_camera_on(true, camera::WIDTH, camera::HEIGHT, camera::FPS, camera::BITRATE);
+        } else {
+            self.camera = None;
+            songbird::video::set_camera_on(false, camera::WIDTH, camera::HEIGHT, camera::FPS, camera::BITRATE);
+            self.cam_tex.remove(&self.me_id);
+        }
+    }
+
     fn send_voice_state(&self, guild: Option<&str>, channel: Option<&str>) {
         tracing::info!("ui: sending voice state guild={guild:?} channel={channel:?} gateway_ready={}", self.gw.is_some());
         if let Some(gw) = &self.gw {
             let p = json!({ "op": 4, "d": {
                 "guild_id": guild, "channel_id": channel,
-                "self_mute": self.muted, "self_deaf": self.deaf, "self_video": false
+                "self_mute": self.muted, "self_deaf": self.deaf, "self_video": self.camera.is_some()
             }});
             let _ = gw.send(p.to_string());
         }
@@ -2221,6 +2307,13 @@ impl App {
             VAction::Join(guild, channel, title) => {
                 if self.in_voice.as_ref().map_or(false, |v| v.1 == channel) {
                     return;
+                }
+                if let Some(c) = self.guilds.iter().flat_map(|g| g.channels.iter()).find(|c| c.id == channel) {
+                    let count = self.voice_members.get(&channel).map_or(0, |v| v.len()) as u64;
+                    if c.limit > 0 && count >= c.limit && !c.bypass_limit {
+                        self.voice_note = format!("{} is full ({count}/{}). Wait for someone to leave.", c.name, c.limit);
+                        return;
+                    }
                 }
                 let _ = self.vtx.send(voice::VoiceMsg::Join { guild: guild.clone(), channel: channel.clone() });
                 self.send_voice_state(guild.as_deref(), Some(&channel));
@@ -2235,6 +2328,7 @@ impl App {
             }
             VAction::Leave => {
                 self.stop_live();
+                self.set_camera(false);
                 if let Some((g, _, _)) = self.in_voice.take() {
                     self.send_voice_state(g.as_deref(), None);
                 }
@@ -2279,6 +2373,13 @@ impl App {
                 }
                 let _ = self.vtx.send(voice::VoiceMsg::StopStream);
                 self.stream_tex = None;
+            }
+            VAction::ToggleCamera => {
+                let on = self.camera.is_none();
+                self.set_camera(on);
+                if let Some((g, c, _)) = self.in_voice.clone() {
+                    self.send_voice_state(g.as_deref(), Some(&c));
+                }
             }
             VAction::ToggleDeaf => {
                 self.deaf = !self.deaf;
@@ -2335,7 +2436,10 @@ impl App {
                         *vact = Some(VAction::ToggleDeaf);
                     }
                     ui.add_space(10.0);
-                    call_button(ui, icons::VIDEO_CAMERA_SLASH, false, "Camera isn't available in Rustcord yet", false);
+                    let cam = self.camera.is_some();
+                    if call_button(ui, if cam { icons::VIDEO_CAMERA } else { icons::VIDEO_CAMERA_SLASH }, cam, if cam { "Turn Off Camera" } else { "Turn On Camera" }, true) {
+                        *vact = Some(VAction::ToggleCamera);
+                    }
                     let live = self.live_key.is_some();
                     if call_button(ui, icons::SCREENCAST, live, if live { "Stop Streaming" } else { "Share Your Screen" }, true) {
                         share_click = true;
@@ -2664,8 +2768,20 @@ impl App {
                                         }
                                         let on = sel_id.as_deref() == Some(c.id.as_str());
                                         let prefix = if c.is_voice() { icons::SPEAKER_HIGH } else { icons::HASH };
+                                        let row_top = ui.cursor().min.y;
                                         if list_row(ui, on, self.unread.contains(&c.id), self.mentions.get(&c.id).copied().unwrap_or(0), None, prefix, &c.name) {
                                             pick = Some(Selected { id: c.id.clone(), title: c.name.clone(), guild: Some(g.id.clone()), voice: c.is_voice() });
+                                        }
+                                        // Voice user limit, like Discord's "03 | 10" pill.
+                                        if c.is_voice() && c.limit > 0 {
+                                            let count = self.voice_members.get(&c.id).map_or(0, |v| v.len());
+                                            let full = count as u64 >= c.limit;
+                                            let row = Rect::from_x_y_ranges(ui.min_rect().left()..=ui.max_rect().right(), row_top..=ui.cursor().min.y);
+                                            let text = format!("{:02} | {:02}", count, c.limit);
+                                            let g = ui.painter().layout_no_wrap(text, FontId::proportional(11.0), if full { RED } else { TEXT });
+                                            let pill = Rect::from_min_size(egui::pos2(row.right() - g.size().x - 18.0, row.center().y - g.size().y / 2.0 - 2.0), g.size() + Vec2::new(10.0, 4.0));
+                                            ui.painter().rect_filled(pill, 4.0, RAIL);
+                                            ui.painter().galley(pill.min + Vec2::new(5.0, 2.0), g, TEXT);
                                         }
                                         if c.is_voice() {
                                             for m in self.voice_members.get(&c.id).map(|v| v.as_slice()).unwrap_or(&[]) {
@@ -2929,7 +3045,7 @@ impl App {
                     Some(w) => {
                         // In a native call: only the chat from Discord's page (no web call screen).
                         w.set_voice(in_this_voice);
-                        w.show(area.response.rect, &url, in_call)
+                        w.show(ctx, area.response.rect, &url, in_call)
                     }
                     None => self.webchat_req = Some(url),
                 }
@@ -2959,7 +3075,10 @@ impl App {
                                 vact = Some(VAction::ToggleDeaf);
                             }
                             ui.add_space(10.0);
-                            call_button(ui, icons::VIDEO_CAMERA_SLASH, false, "Camera isn't available in Rustcord yet", false);
+                            let cam = self.camera.is_some();
+                            if call_button(ui, if cam { icons::VIDEO_CAMERA } else { icons::VIDEO_CAMERA_SLASH }, cam, if cam { "Turn Off Camera" } else { "Turn On Camera" }, true) {
+                                vact = Some(VAction::ToggleCamera);
+                            }
                             let live = self.live_key.is_some();
                             if call_button(ui, icons::SCREENCAST, live, if live { "Stop Streaming" } else { "Share Your Screen" }, true) {
                                 share_click = true;
@@ -2994,7 +3113,7 @@ impl App {
                         match &mut self.webchat {
                             Some(w) => {
                                 w.set_voice(true);
-                                w.show(panel.response.rect, &url, false)
+                                w.show(ctx, panel.response.rect, &url, false)
                             }
                             None => self.webchat_req = Some(url),
                         }
@@ -3062,7 +3181,14 @@ impl App {
                         ui.label(RichText::new(&title).size(22.0).strong().family(semi()).color(BRIGHT));
                         ui.add_space(6.0);
                         let n = self.voice_members.get(&id).map_or(0, |v| v.len());
-                        let who = if n == 0 { "No one is here yet.".to_string() } else { format!("{n} in voice") };
+                        let limit = self.guilds.iter().flat_map(|g| g.channels.iter()).find(|c| c.id == id).map_or(0, |c| c.limit);
+                        let who = match (n, limit) {
+                            (0, 0) => "No one is here yet.".to_string(),
+                            (0, l) => format!("No one is here yet. Up to {l} people can join."),
+                            (n, 0) => format!("{n} in voice"),
+                            (n, l) if n as u64 >= l => format!("{n}/{l} in voice: this channel is full"),
+                            (n, l) => format!("{n}/{l} in voice"),
+                        };
                         ui.label(RichText::new(who).color(MUTED));
                         ui.add_space(14.0);
                         let join = egui::Button::new(RichText::new("Join Voice").strong().family(semi()).color(Color32::WHITE)).fill(GREEN).min_size(Vec2::new(160.0, 38.0)).rounding(4.0);
@@ -4319,9 +4445,30 @@ impl App {
                 if speaking.contains(&m.user) {
                     p.rect_stroke(rect, 10.0, Stroke::new(3.0_f32, GREEN));
                 }
-                let face = Rect::from_center_size(rect.center() - Vec2::new(0.0, 12.0), Vec2::splat(64.0));
-                egui::Image::new(av).rounding(32.0).paint_at(ui, face);
-                p.text(egui::pos2(rect.center().x, rect.bottom() - 16.0), Align2::CENTER_CENTER, name, FontId::proportional(14.0), BRIGHT);
+                // Camera on: their video fills the tile (cropped to its shape), like Discord.
+                if let Some(t) = self.cam_tex.get(&m.user) {
+                    let img = t.size_vec2();
+                    let (ta, ia) = (rect.width() / rect.height(), img.x / img.y.max(1.0));
+                    let uv = if ia > ta {
+                        let w = ta / ia;
+                        Rect::from_min_max(egui::pos2((1.0 - w) / 2.0, 0.0), egui::pos2((1.0 + w) / 2.0, 1.0))
+                    } else {
+                        let h = ia / ta;
+                        Rect::from_min_max(egui::pos2(0.0, (1.0 - h) / 2.0), egui::pos2(1.0, (1.0 + h) / 2.0))
+                    };
+                    egui::Image::new(egui::load::SizedTexture::new(t.id(), rect.size())).uv(uv).rounding(10.0).paint_at(ui, rect);
+                    // name on a dark strip so it stays readable over the video
+                    let strip = Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 28.0), rect.right_bottom());
+                    p.rect_filled(strip, egui::Rounding { nw: 0.0, ne: 0.0, sw: 10.0, se: 10.0 }, Color32::from_black_alpha(140));
+                } else {
+                    let face = Rect::from_center_size(rect.center() - Vec2::new(0.0, 12.0), Vec2::splat(64.0));
+                    egui::Image::new(av).rounding(32.0).paint_at(ui, face);
+                }
+                {
+                    // centred name with colour emojis: measure off-screen first, then draw
+                    let w = paint_rich(ui, &p.with_clip_rect(Rect::NOTHING), egui::pos2(0.0, 0.0), name, 14.0, BRIGHT, rect.width() - 16.0);
+                    paint_rich(ui, &p, egui::pos2(rect.center().x - w / 2.0, rect.bottom() - 16.0), name, 14.0, BRIGHT, rect.width() - 16.0);
+                }
                 // Right-click someone else's tile: their volume.
                 if m.user != self.me_id && ui.rect_contains_pointer(rect) && ui.input(|i| i.pointer.secondary_clicked()) {
                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
@@ -4345,12 +4492,18 @@ impl App {
                     p.circle_filled(c, 12.0, Color32::from_rgb(30, 31, 34));
                     p.text(c, Align2::CENTER_CENTER, icon, FontId::proportional(14.0), RED);
                 }
-                if live && !resp.hovered() {
-                    let pill = Rect::from_center_size(rect.center() - Vec2::new(0.0, 12.0), Vec2::new(76.0, 30.0));
-                    p.rect_filled(pill, 15.0, Color32::from_black_alpha(190));
-                    p.text(pill.center(), Align2::CENTER_CENTER, "Watch", FontId::proportional(14.0), Color32::WHITE);
+                // The stream you're already watching says so (clicking it again does nothing).
+                let watched = live && self.watching.as_ref().map_or(false, |w| w.0.ends_with(&format!(":{}", m.user)));
+                if watched {
+                    p.rect_stroke(rect, 10.0, Stroke::new(2.0_f32, ACCENT));
                 }
-                if live {
+                if live && (!resp.hovered() || watched) {
+                    let (txt, w) = if watched { ("Watching", 96.0) } else { ("Watch", 76.0) };
+                    let pill = Rect::from_center_size(rect.center() - Vec2::new(0.0, 12.0), Vec2::new(w, 30.0));
+                    p.rect_filled(pill, 15.0, if watched { ACCENT } else { Color32::from_black_alpha(190) });
+                    p.text(pill.center(), Align2::CENTER_CENTER, txt, FontId::proportional(14.0), Color32::WHITE);
+                }
+                if live && !watched {
                     if resp.hovered() {
                         p.text(rect.center() - Vec2::new(0.0, 12.0), Align2::CENTER_CENTER, "Watch Stream", FontId::proportional(15.0), Color32::WHITE);
                     }
@@ -4446,6 +4599,37 @@ impl eframe::App for App {
             match &mut self.stream_tex {
                 Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                 None => self.stream_tex = Some(ctx.load_texture("stream", img, egui::TextureOptions::LINEAR)),
+            }
+        }
+        // Newest camera pictures -> textures; drop cameras that were turned off.
+        for (user, img) in stream::take_camera_frames() {
+            let key = user.to_string();
+            match self.cam_tex.get_mut(&key) {
+                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                None => {
+                    let t = ctx.load_texture(format!("cam-{key}"), img, egui::TextureOptions::LINEAR);
+                    self.cam_tex.insert(key, t);
+                }
+            }
+        }
+        let cam_failed = self.camera_err.lock().unwrap().take();
+        if let Some(e) = cam_failed {
+            self.set_camera(false);
+            self.voice_note = e;
+            if let Some((g, c, _)) = self.in_voice.clone() {
+                self.send_voice_state(g.as_deref(), Some(&c));
+            }
+        }
+        if !self.cam_tex.is_empty() {
+            let me_on = self.camera.is_some();
+            let gone: Vec<String> = self
+                .cam_tex
+                .keys()
+                .filter(|u| !(me_on && **u == self.me_id) && !u.parse::<u64>().map_or(false, songbird::video::has_camera))
+                .cloned()
+                .collect();
+            for u in gone {
+                self.cam_tex.remove(&u);
             }
         }
         if !self.member_requests.is_empty() && self.phase == Phase::Main {
