@@ -1,0 +1,34 @@
+Copyright (c) 2026 Rustcord developers. All rights reserved.
+
+This repository is published so that people can read the source code and download
+official builds of Rustcord. That is the only permission granted.
+
+Unless you have written permission from the copyright holders, you may NOT:
+
+  - copy, reproduce or republish this software or its source code, in whole or in part;
+  - modify it or create derivative works based on it;
+  - distribute, sublicense, sell or rent it, or any modified version of it;
+  - use any part of it in another project, product or service;
+  - remove or change this notice or any other copyright notice in it.
+
+Viewing the source on GitHub and forking it within GitHub are allowed only to the
+extent required by GitHub's Terms of Service; no other rights are granted by doing so.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.
+IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+Rustcord is not affiliated with, endorsed or sponsored by Discord Inc. "Discord" is a
+trademark of Discord Inc.
+
+-------------------------------------------------------------------------------
+Third-party code
+-------------------------------------------------------------------------------
+
+The folder vendor/songbird contains a modified copy of Songbird, which is NOT covered
+by the notice above. It remains under its own ISC licence (see
+vendor/songbird/LICENSE.md), Copyright (c) 2020, Songbird Contributors. Rustcord's
+changes to that folder are released under the same ISC licence.
+
+Other libraries Rustcord uses are downloaded at build time under their own licences
+(listed in Cargo.lock).

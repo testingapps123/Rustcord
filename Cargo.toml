@@ -2,7 +2,9 @@
 name = "rustcord"
 version = "0.2.0"
 edition = "2021"
-description = "A native Rust desktop client for Discord text chat (no web engine)"
+description = "A native Rust desktop client for Discord"
+license-file = "LICENSE"
+publish = false
 
 [dependencies]
 eframe = "0.29"
