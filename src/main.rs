@@ -8,15 +8,19 @@
 
 #[allow(dead_code)]
 mod login;
+mod fonts;
+mod net;
 #[allow(dead_code)]
 mod qr_login;
 /// Phosphor icon font (Discord-style line icons).
 mod icons {
     pub use egui_phosphor::regular::*;
 }
+mod share;
 mod stream;
 mod voice;
 mod weblogin;
+mod webchat;
 
 use eframe::egui::{self, Align2, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2};
 use serde_json::{json, Value};
@@ -77,6 +81,8 @@ struct Guild {
     channels: Vec<Chan>, // display order, categories included
     /// role id -> (name, colour)
     roles: HashMap<String, (String, Option<Color32>)>,
+    /// role id -> position (higher = shown first; decides the name colour)
+    role_pos: HashMap<String, i64>,
 }
 
 /// One row of Discord's member list (a group header or a member).
@@ -96,7 +102,7 @@ fn member_row(item: &Value, roles: &HashMap<String, (String, Option<Color32>)>) 
         return None;
     }
     let u = &m["user"];
-    let name = m["nick"].as_str().filter(|n| !n.is_empty()).map(String::from).unwrap_or_else(|| display_name(u));
+    let name = m["nick"].as_str().filter(|n| !n.is_empty()).map(rtl).unwrap_or_else(|| display_name(u));
     let status = m["presence"]["status"].as_str().unwrap_or("offline").to_string();
     let color = arr(&m["roles"]).iter().filter_map(|r| r.as_str()).filter_map(|r| roles.get(r).and_then(|x| x.1)).next();
     Some(ListRow::Member { name, avatar: avatar_url(u), status, color })
@@ -204,6 +210,8 @@ struct Msg {
     /// (author, text) of the message this one replies to
     reply: Option<(String, String)>,
     reactions: Vec<Reaction>,
+    /// the author's server roles (name colour)
+    roles: Vec<String>,
 }
 
 /// Discord-style local timestamps.
@@ -262,6 +270,11 @@ enum Evt {
     VoiceMember { channel: Option<String>, user: String, name: String, avatar: String, streaming: bool, muted: bool, deafened: bool },
     NeedUser(Option<String>, String),
     Typing { channel: String, user: String, name: Option<String> },
+    /// Ok(server name) or Err((message, needs CAPTCHA))
+    JoinResult(Result<String, (String, bool)>),
+    Pins(String, Result<Vec<Msg>, String>),
+    SearchResults(Result<(Vec<(String, Msg)>, u64), String>),
+    DmOpened(Dm),
     MemberList(String, Value),
     UserInfo { user: String, name: String, avatar: String },
     GuildAdd(Guild),
@@ -291,6 +304,13 @@ enum Cmd {
     Pin(String, String),
     Ring(String),
     User(String),
+    /// accept a server invite (code only)
+    JoinInvite(String),
+    Pins(String),
+    Search { guild: Option<String>, ch: String, query: String },
+    OpenDm(String),
+    /// mark a channel read up to this message (syncs to your other devices)
+    Ack(String, String),
 }
 
 // ---------- JSON helpers ----------
@@ -303,13 +323,32 @@ fn s(v: &Value, k: &str) -> String {
     v[k].as_str().unwrap_or("").to_string()
 }
 
+/// Arabic / Hebrew text: join the letters (Arabic shaping) and put right-to-left runs in
+/// display order, since egui draws characters left to right one by one.
+fn rtl(s: &str) -> String {
+    // Invisible emoji modifiers (variation selectors, joiners) would be drawn as boxes.
+    let owned: String;
+    let s = if s.chars().any(fonts::invisible) {
+        owned = s.chars().filter(|c| !fonts::invisible(*c)).collect();
+        owned.as_str()
+    } else {
+        s
+    };
+    if !s.chars().any(|c| matches!(c as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF)) {
+        return s.to_string();
+    }
+    s.split('\n')
+        .map(|line| {
+            let shaped = ar_reshaper::reshape_line(line);
+            let info = unicode_bidi::BidiInfo::new(&shaped, None);
+            info.paragraphs.iter().map(|p| info.reorder_line(p, p.range.clone()).into_owned()).collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn display_name(u: &Value) -> String {
-    u["global_name"]
-        .as_str()
-        .filter(|x| !x.is_empty())
-        .or(u["username"].as_str())
-        .unwrap_or("unknown")
-        .to_string()
+    rtl(u["global_name"].as_str().filter(|x| !x.is_empty()).or(u["username"].as_str()).unwrap_or("unknown"))
 }
 
 fn avatar_url(u: &Value) -> String {
@@ -336,7 +375,7 @@ fn sized_image(proxy: &str, w: f32, h: f32) -> Option<Img> {
 }
 
 fn parse_msg(m: &Value) -> Msg {
-    let mut content = clean_text(&s(m, "content"), m);
+    let mut content = rtl(&clean_text(&s(m, "content"), m));
     let mut images = Vec::new();
     for a in arr(&m["attachments"]) {
         let name = s(a, "filename");
@@ -403,8 +442,10 @@ fn parse_msg(m: &Value) -> Msg {
         author_id: s(&m["author"], "id"),
         raw: s(m, "content"),
         pings_me: false,
-        author: display_name(&m["author"]),
+        // Server nickname first, like Discord.
+        author: m["member"]["nick"].as_str().filter(|n| !n.is_empty()).map(rtl).unwrap_or_else(|| display_name(&m["author"])),
         avatar: avatar_url(&m["author"]),
+        roles: arr(&m["member"]["roles"]).iter().filter_map(|r| r.as_str().map(String::from)).collect(),
         content,
         images,
         time,
@@ -415,12 +456,61 @@ fn parse_msg(m: &Value) -> Msg {
     }
 }
 
-fn parse_guild(g: &Value) -> Option<Guild> {
+/// Discord permission check: can `me` (with `my_roles`) see channel `c`? Unknown roles -> show it.
+fn perm_bits(v: &Value) -> u64 {
+    v.as_str().and_then(|x| x.parse().ok()).or(v.as_u64()).unwrap_or(0)
+}
+
+fn base_perms(g: &Value, me: &str, my_roles: Option<&[String]>) -> Option<u64> {
+    let my_roles = my_roles?;
+    let gid = s(g, "id");
+    let owner = g["owner_id"].as_str().or(g["properties"]["owner_id"].as_str()).unwrap_or("");
+    if !me.is_empty() && owner == me {
+        return Some(u64::MAX);
+    }
+    let roles = arr(&g["roles"]);
+    let role_perm = |id: &str| roles.iter().find(|r| r["id"].as_str() == Some(id)).map_or(0, |r| perm_bits(&r["permissions"]));
+    let mut p = role_perm(&gid);
+    for r in my_roles {
+        p |= role_perm(r);
+    }
+    Some(if p & 0x8 != 0 { u64::MAX } else { p })
+}
+
+fn can_view(c: &Value, gid: &str, me: &str, my_roles: &[String], base: u64) -> bool {
+    if base == u64::MAX {
+        return true;
+    }
+    const VIEW: u64 = 1 << 10;
+    let ows = arr(&c["permission_overwrites"]);
+    let is_member = |o: &Value| o["type"].as_u64() == Some(1) || o["type"].as_str() == Some("member");
+    let mut p = base;
+    if let Some(o) = ows.iter().find(|o| o["id"].as_str() == Some(gid)) {
+        p &= !perm_bits(&o["deny"]);
+        p |= perm_bits(&o["allow"]);
+    }
+    let (mut deny, mut allow) = (0u64, 0u64);
+    for o in ows.iter().filter(|o| !is_member(o) && o["id"].as_str().map_or(false, |id| id != gid && my_roles.iter().any(|r| r == id))) {
+        deny |= perm_bits(&o["deny"]);
+        allow |= perm_bits(&o["allow"]);
+    }
+    p &= !deny;
+    p |= allow;
+    if let Some(o) = ows.iter().find(|o| is_member(o) && o["id"].as_str() == Some(me)) {
+        p &= !perm_bits(&o["deny"]);
+        p |= perm_bits(&o["allow"]);
+    }
+    p & VIEW != 0
+}
+
+fn parse_guild(g: &Value, me: &str, my_roles: Option<&[String]>) -> Option<Guild> {
+    let base = base_perms(g, me, my_roles);
+    let gid_s = s(g, "id");
     if g["unavailable"].as_bool() == Some(true) {
         return None;
     }
     let id = s(g, "id");
-    let name = g["name"].as_str().or(g["properties"]["name"].as_str())?.to_string();
+    let name = rtl(g["name"].as_str().or(g["properties"]["name"].as_str())?);
     let icon = g["icon"]
         .as_str()
         .or(g["properties"]["icon"].as_str())
@@ -432,9 +522,17 @@ fn parse_guild(g: &Value) -> Option<Guild> {
             if ![0, 2, 4, 5, 13].contains(&kind) {
                 return None;
             }
+            // Hidden channels (no View Channel permission) aren't listed, like in Discord.
+            if kind != 4 {
+                if let (Some(b), Some(r)) = (base, my_roles) {
+                    if !can_view(c, &gid_s, me, r, b) {
+                        return None;
+                    }
+                }
+            }
             Some(Chan {
                 id: s(c, "id"),
-                name: s(c, "name"),
+                name: rtl(&s(c, "name")),
                 kind,
                 position: c["position"].as_i64().unwrap_or(0),
                 parent: c["parent_id"].as_str().map(String::from),
@@ -471,7 +569,8 @@ fn parse_guild(g: &Value) -> Option<Guild> {
             (s(r, "id"), (s(r, "name"), color))
         })
         .collect();
-    Some(Guild { id, name, icon, channels: ordered, roles })
+    let role_pos = arr(&g["roles"]).iter().map(|r| (s(r, "id"), r["position"].as_i64().unwrap_or(0))).collect();
+    Some(Guild { id, name, icon, channels: ordered, roles, role_pos })
 }
 
 fn parse_dm(c: &Value, users: &HashMap<String, (String, String)>) -> Dm {
@@ -484,7 +583,7 @@ fn parse_dm(c: &Value, users: &HashMap<String, (String, String)>) -> Dm {
             .map(|i| users.get(i).cloned().unwrap_or_else(|| ("unknown".into(), format!("{CDN}/embed/avatars/0.png"))))
             .collect();
     }
-    let name = c["name"].as_str().filter(|n| !n.is_empty()).map(String::from).unwrap_or_else(|| {
+    let name = c["name"].as_str().filter(|n| !n.is_empty()).map(rtl).unwrap_or_else(|| {
         if people.is_empty() { "Direct message".into() } else { people.iter().map(|p| p.0.clone()).collect::<Vec<_>>().join(", ") }
     });
     let avatar = match c["icon"].as_str() {
@@ -536,7 +635,12 @@ fn run_gateway(
     vtx: &VoiceTx,
     me_id: &mut String,
 ) -> GwErr {
-    let (mut ws, _) = match tungstenite::connect(GATEWAY) {
+    // Through the Drover-style proxy when one is set.
+    let tcp = match net::connect("gateway.discord.gg", 443) {
+        Ok(s) => s,
+        Err(e) => return GwErr::Other(format!("can't reach Discord: {e}")),
+    };
+    let (mut ws, _) = match tungstenite::client_tls(GATEWAY, tcp) {
         Ok(x) => x,
         Err(e) => return GwErr::Other(e.to_string()),
     };
@@ -632,7 +736,20 @@ fn dispatch(t: &str, d: &Value, out: &Sender<Evt>, delay: &mut u64, vtx: &VoiceT
                 users.insert(s(u, "id"), (display_name(u), avatar_url(u)));
             }
             users.insert(me_id.clone(), (display_name(&d["user"]), avatar_url(&d["user"])));
-            let guilds = arr(&d["guilds"]).iter().filter_map(parse_guild).collect();
+            // My own roles per server (user accounts get them in merged_members, same order as guilds).
+            let merged = arr(&d["merged_members"]);
+            let guilds = arr(&d["guilds"])
+                .iter()
+                .enumerate()
+                .filter_map(|(i, g)| {
+                    let mine = merged
+                        .get(i)
+                        .and_then(|list| arr(list).iter().find(|m| m["user_id"].as_str() == Some(me_id.as_str()) || m["user"]["id"].as_str() == Some(me_id.as_str())).cloned())
+                        .or_else(|| arr(&g["members"]).iter().find(|m| m["user"]["id"].as_str() == Some(me_id.as_str())).cloned());
+                    let roles: Option<Vec<String>> = mine.map(|m| arr(&m["roles"]).iter().filter_map(|r| r.as_str().map(String::from)).collect());
+                    parse_guild(g, me_id, roles.as_deref())
+                })
+                .collect();
             let mut dms: Vec<Dm> = arr(&d["private_channels"]).iter().map(|c| parse_dm(c, &users)).collect();
             dms.sort_by(|a, b| b.last.cmp(&a.last));
             let _ = out.send(Evt::Ready {
@@ -673,12 +790,12 @@ fn dispatch(t: &str, d: &Value, out: &Sender<Evt>, delay: &mut u64, vtx: &VoiceT
             if !u.is_object() && user != *me_id {
                 let _ = out.send(Evt::NeedUser(d["guild_id"].as_str().map(String::from), user.clone()));
             }
-            let name = d["member"]["nick"].as_str().map(String::from).unwrap_or_else(|| {
+            let name = d["member"]["nick"].as_str().map(rtl).unwrap_or_else(|| {
                 if u.is_object() { display_name(u) } else { "…".into() }
             });
             let avatar = if u.is_object() { avatar_url(u) } else { format!("{CDN}/embed/avatars/0.png") };
             let streaming = d["self_stream"].as_bool().unwrap_or(false);
-            tracing::info!(
+            tracing::debug!(
                 "gateway: voice state user={user} channel={channel:?} self_stream={:?} self_video={:?}",
                 d["self_stream"], d["self_video"]
             );
@@ -686,11 +803,32 @@ fn dispatch(t: &str, d: &Value, out: &Sender<Evt>, delay: &mut u64, vtx: &VoiceT
             let deafened = d["self_deaf"].as_bool() == Some(true) || d["deaf"].as_bool() == Some(true);
             let _ = out.send(Evt::VoiceMember { channel, user, name, avatar, streaming, muted, deafened });
         }
+        // DM / group calls: who is already in the call (and whether it is ringing you).
+        "CALL_CREATE" | "CALL_UPDATE" => {
+            let ch = s(d, "channel_id");
+            for vs in arr(&d["voice_states"]) {
+                let user = s(vs, "user_id");
+                if user.is_empty() {
+                    continue;
+                }
+                if user != *me_id {
+                    let _ = out.send(Evt::NeedUser(None, user.clone()));
+                }
+                let muted = vs["self_mute"].as_bool() == Some(true) || vs["mute"].as_bool() == Some(true);
+                let deafened = vs["self_deaf"].as_bool() == Some(true) || vs["deaf"].as_bool() == Some(true);
+                let streaming = vs["self_stream"].as_bool().unwrap_or(false);
+                let channel = vs["channel_id"].as_str().map(String::from).or_else(|| Some(ch.clone()));
+                let _ = out.send(Evt::VoiceMember { channel, user, name: "…".into(), avatar: format!("{CDN}/embed/avatars/0.png"), streaming, muted, deafened });
+            }
+            if t == "CALL_CREATE" && arr(&d["ringing"]).iter().any(|u| u.as_str() == Some(me_id.as_str())) {
+                let _ = out.send(Evt::Status("Incoming call: open the DM and press Call to join.".into()));
+            }
+        }
         "TYPING_START" => {
             let user = s(d, "user_id");
             if user != *me_id {
                 let u = &d["member"]["user"];
-                let name = d["member"]["nick"].as_str().map(String::from).filter(|n| !n.is_empty()).or_else(|| u.is_object().then(|| display_name(u)));
+                let name = d["member"]["nick"].as_str().map(rtl).filter(|n| !n.is_empty()).or_else(|| u.is_object().then(|| display_name(u)));
                 let _ = out.send(Evt::Typing { channel: s(d, "channel_id"), user, name });
             }
         }
@@ -716,7 +854,7 @@ fn dispatch(t: &str, d: &Value, out: &Sender<Evt>, delay: &mut u64, vtx: &VoiceT
                 if !u.is_object() {
                     continue;
                 }
-                let name = m["nick"].as_str().filter(|n| !n.is_empty()).map(String::from).unwrap_or_else(|| display_name(u));
+                let name = m["nick"].as_str().filter(|n| !n.is_empty()).map(rtl).unwrap_or_else(|| display_name(u));
                 let _ = out.send(Evt::UserInfo { user: s(u, "id"), name, avatar: avatar_url(u) });
             }
         }
@@ -728,7 +866,11 @@ fn dispatch(t: &str, d: &Value, out: &Sender<Evt>, delay: &mut u64, vtx: &VoiceT
             });
         }
         "GUILD_CREATE" => {
-            if let Some(g) = parse_guild(d) {
+            let roles: Option<Vec<String>> = arr(&d["members"])
+                .iter()
+                .find(|m| m["user"]["id"].as_str() == Some(me_id.as_str()))
+                .map(|m| arr(&m["roles"]).iter().filter_map(|r| r.as_str().map(String::from)).collect());
+            if let Some(g) = parse_guild(d, me_id, roles.as_deref()) {
                 let _ = out.send(Evt::GuildAdd(g));
             }
         }
@@ -767,7 +909,7 @@ fn dispatch(t: &str, d: &Value, out: &Sender<Evt>, delay: &mut u64, vtx: &VoiceT
 // ---------- REST (history + sending) ----------
 
 fn rest_worker(auth: String, rx: Receiver<Cmd>, out: Sender<Evt>, ctx: egui::Context) {
-    let client = reqwest::blocking::Client::builder()
+    let client = net::http_client()
         .user_agent(UA)
         .timeout(Duration::from_secs(20))
         .build()
@@ -881,6 +1023,58 @@ fn rest_worker(auth: String, rx: Receiver<Cmd>, out: Sender<Evt>, ctx: egui::Con
                     .send();
                 continue;
             }
+            Cmd::JoinInvite(code) => {
+                let r = client
+                    .post(format!("{API}/invites/{code}"))
+                    .header("Authorization", &auth)
+                    .json(&json!({}))
+                    .send()
+                    .map_err(|e| (format!("Couldn't reach Discord: {e}"), false))
+                    .and_then(|resp| {
+                        let status = resp.status();
+                        let body: Value = resp.json().unwrap_or(Value::Null);
+                        if status.is_success() {
+                            Ok(body["guild"]["name"].as_str().unwrap_or("the server").to_string())
+                        } else if body.get("captcha_key").is_some() {
+                            Err(("Discord wants a CAPTCHA before joining.".to_string(), true))
+                        } else if body["code"].as_u64() == Some(10006) || status.as_u16() == 404 {
+                            Err(("That invite is invalid or has expired.".to_string(), false))
+                        } else {
+                            Err((body["message"].as_str().map(String::from).unwrap_or_else(|| format!("Discord returned {status}")), false))
+                        }
+                    });
+                Evt::JoinResult(r)
+            }
+            Cmd::Pins(ch) => {
+                let r = client.get(format!("{API}/channels/{ch}/pins")).header("Authorization", &auth).send().map_err(|e| e.to_string()).and_then(check);
+                Evt::Pins(ch, r.map(|v| arr(&v).iter().map(parse_msg).collect()))
+            }
+            Cmd::Search { guild, ch, query } => {
+                let url = match &guild {
+                    Some(g) => format!("{API}/guilds/{g}/messages/search?content={}", pct(&query)),
+                    None => format!("{API}/channels/{ch}/messages/search?content={}", pct(&query)),
+                };
+                let r = client.get(url).header("Authorization", &auth).send().map_err(|e| e.to_string()).and_then(|resp| {
+                    if resp.status().as_u16() == 202 {
+                        return Err("Search is still getting ready for this server. Try again in a few seconds.".to_string());
+                    }
+                    check(resp)
+                });
+                Evt::SearchResults(r.map(|v| {
+                    let hits = arr(&v["messages"]).iter().filter_map(|group| arr(group).first()).map(|m| (s(m, "channel_id"), parse_msg(m))).collect();
+                    (hits, v["total_results"].as_u64().unwrap_or(0))
+                }))
+            }
+            Cmd::OpenDm(user) => {
+                match client.post(format!("{API}/users/@me/channels")).header("Authorization", &auth).json(&json!({ "recipient_id": user })).send().map_err(|e| e.to_string()).and_then(check) {
+                    Ok(c) => Evt::DmOpened(parse_dm(&c, &HashMap::new())),
+                    Err(e) => Evt::Status(format!("Couldn't open DM: {e}")),
+                }
+            }
+            Cmd::Ack(ch, id) => {
+                let _ = client.post(format!("{API}/channels/{ch}/messages/{id}/ack")).header("Authorization", &auth).json(&json!({ "token": null })).send();
+                continue;
+            }
             Cmd::User(id) => {
                 match client.get(format!("{API}/users/{id}")).header("Authorization", &auth).send().map_err(|e| e.to_string()).and_then(check) {
                     Ok(u) => Evt::UserInfo { user: id, name: display_name(&u), avatar: avatar_url(&u) },
@@ -927,7 +1121,7 @@ fn initials(name: &str) -> String {
 }
 
 /// A round server button for the left rail, Discord-style.
-fn rail_button(ui: &mut egui::Ui, selected: bool, unread: bool, badge: u32, icon: Option<&str>, label: &str, tip: &str) -> bool {
+fn rail_button(ui: &mut egui::Ui, selected: bool, unread: bool, badge: u32, icon: Option<&str>, label: &str, tip: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
     let hovered = resp.hovered();
     let r = if selected || hovered { 16.0 } else { 24.0 };
@@ -947,7 +1141,11 @@ fn rail_button(ui: &mut egui::Ui, selected: bool, unread: bool, badge: u32, icon
         }
     }
     mention_badge(&painter, rect.right_bottom() - Vec2::new(2.0, 2.0), badge);
-    resp.on_hover_text(tip).clicked()
+    if tip.is_empty() {
+        resp
+    } else {
+        resp.on_hover_text(tip)
+    }
 }
 
 /// Discord Markdown: **bold**, *italic*, __underline__, ~~strike~~, `code`, ||spoiler||,
@@ -1054,6 +1252,52 @@ fn inline_job(line: &str) -> egui::text::LayoutJob {
     }
     push(&mut job, &mut buf, bold, italic, under, strike, code, spoiler);
     job
+}
+
+/// A stable banner colour per user (Discord shows a profile colour there).
+fn colorful(id: &str) -> Color32 {
+    let h = id.bytes().fold(7u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+    let pal = [ACCENT, Color32::from_rgb(235, 69, 158), Color32::from_rgb(87, 242, 135), Color32::from_rgb(254, 231, 92), Color32::from_rgb(237, 66, 69), Color32::from_rgb(59, 165, 93)];
+    pal[(h as usize) % pal.len()]
+}
+
+/// Compact message row for the pins / search panel.
+fn mini_message(ui: &mut egui::Ui, m: &Msg) {
+    ui.add_space(4.0);
+    ui.horizontal_top(|ui| {
+        ui.add(egui::Image::new(m.avatar.as_str()).fit_to_exact_size(Vec2::splat(28.0)).rounding(14.0));
+        ui.vertical(|ui| {
+            ui.set_max_width(ui.available_width() - 4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&m.author).strong().family(semi()).color(BRIGHT));
+                ui.label(RichText::new(&m.time).size(11.0).color(MUTED));
+            });
+            if !m.content.is_empty() {
+                markdown(ui, &m.content);
+            }
+            for img in m.images.iter().take(1) {
+                let s = img.size * (220.0 / img.size.x.max(220.0));
+                ui.add(egui::Image::new(img.url.as_str()).fit_to_exact_size(s).rounding(4.0));
+            }
+        });
+    });
+    ui.add_space(4.0);
+}
+
+/// Pull the invite code out of "hTKzmak", "discord.gg/hTKzmak", "https://discord.com/invite/hTKzmak?x=1"...
+fn invite_code(input: &str) -> Option<String> {
+    let mut s = input.trim();
+    for p in ["https://", "http://", "www."] {
+        s = s.strip_prefix(p).unwrap_or(s);
+    }
+    for p in ["discord.gg/", "discord.com/invite/", "discordapp.com/invite/", "ptb.discord.com/invite/", "canary.discord.com/invite/"] {
+        if let Some(rest) = s.strip_prefix(p) {
+            s = rest;
+            break;
+        }
+    }
+    let code: String = s.split(['/', '?', '#']).next().unwrap_or("").to_string();
+    (!code.is_empty() && code.len() <= 32 && code.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')).then_some(code)
 }
 
 /// Round call-control button (Discord's bottom bar). `on` = highlighted (e.g. muted).
@@ -1220,6 +1464,35 @@ struct App {
     voice_chat_open: bool,
     call_fullscreen: bool,
     vc_draft: String,
+    // ---- join a server ----
+    join_open: bool,
+    join_input: String,
+    join_busy: bool,
+    join_msg: Option<(String, bool)>,
+    join_captcha_code: Option<String>,
+    // ---- pins / search / profile popout / read state ----
+    pins: Option<(String, Option<Result<Vec<Msg>, String>>)>,
+    search_query: String,
+    search: Option<Option<Result<(Vec<(String, Msg)>, u64), String>>>,
+    profile_pop: Option<(String, String, String, egui::Pos2)>,
+    last_ack: HashMap<String, Instant>,
+    /// Discord's web app in the chat area (only while web chat is on)
+    webchat: Option<webchat::WebChat>,
+    webchat_req: Option<String>,
+    /// a voice channel / call was opened in web mode: keep the page alive and untrimmed
+    web_call: bool,
+    // ---- going live ----
+    share_open: bool,
+    share_sources: Vec<share::SourceInfo>,
+    share_pick: usize,
+    share_height: u32,
+    share_fps: u32,
+    sharing: Option<share::Sharer>,
+    live_key: Option<String>,
+    live_on_air: bool,
+    live_note: String,
+    preview: share::Preview,
+    preview_tex: Option<egui::TextureHandle>,
     me_id: String,
     vtx: VoiceTx,
     /// (server, channel, title) of the voice channel or DM call we're in
@@ -1262,6 +1535,7 @@ struct App {
     meter: Arc<std::sync::atomic::AtomicU32>,
     meter_val: f32,
     settings_open: bool,
+    settings_tab: u8,
     devices: (Vec<String>, Vec<String>),
     recording_key: bool,
     mic_testing: bool,
@@ -1317,28 +1591,49 @@ fn token_path() -> PathBuf {
     PathBuf::from(base).join("Rustcord").join("token.txt")
 }
 
+fn semi() -> egui::FontFamily {
+    egui::FontFamily::Name("semi".into())
+}
+
 fn setup_style(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    let files = [("segoe", "segoeui.ttf", true), ("emoji", "seguiemj.ttf", false), ("symbol", "seguisym.ttf", false)];
-    for (name, file, primary) in files {
+    let mut font_defs = egui::FontDefinitions::default();
+    // Fallbacks so names in other scripts / fancy letters don't show as boxes:
+    // Arabic & Hebrew (Tahoma), historic scripts, Indic (Nirmala), fancy math letters (Cambria Math).
+    let files = [
+        ("segoe", "segoeui.ttf", true, 0),
+        ("emoji", "seguiemj.ttf", false, 0),
+        ("symbol", "seguisym.ttf", false, 0),
+        ("tahoma", "tahoma.ttf", false, 0),
+        ("historic", "seguihis.ttf", false, 0),
+        ("nirmala", "Nirmala.ttc", false, 0),
+        ("math", "cambria.ttc", false, 1),
+    ];
+    for (name, file, primary, index) in files {
         if let Ok(bytes) = fs::read(format!("C:\\Windows\\Fonts\\{file}")) {
-            fonts.font_data.insert(name.into(), egui::FontData::from_owned(bytes));
-            let fam = fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap();
+            let stat = fonts::leak(bytes);
+            fonts::register(stat, index);
+            let mut data = egui::FontData::from_static(stat);
+            data.index = index;
+            font_defs.font_data.insert(name.into(), data);
+            let fam = font_defs.families.get_mut(&egui::FontFamily::Proportional).unwrap();
             if primary { fam.insert(0, name.into()) } else { fam.push(name.into()) }
         }
     }
     // Bold / italic families for Markdown (fall back to the normal font if missing).
-    let base = fonts.families[&egui::FontFamily::Proportional].clone();
-    for (family, file) in [("bold", "segoeuib.ttf"), ("italic", "segoeuii.ttf")] {
+    let base = font_defs.families[&egui::FontFamily::Proportional].clone();
+    // Discord's names and titles are semibold (Segoe UI Semibold is the closest Windows font).
+    for (family, file) in [("bold", "segoeuib.ttf"), ("italic", "segoeuii.ttf"), ("semi", "seguisb.ttf")] {
         let mut list = base.clone();
         if let Ok(bytes) = fs::read(format!("C:\\Windows\\Fonts\\{file}")) {
-            fonts.font_data.insert(family.into(), egui::FontData::from_owned(bytes));
+            let stat = fonts::leak(bytes);
+            fonts::register(stat, 0);
+            font_defs.font_data.insert(family.into(), egui::FontData::from_static(stat));
             list.insert(0, family.into());
         }
-        fonts.families.insert(egui::FontFamily::Name(family.into()), list);
+        font_defs.families.insert(egui::FontFamily::Name(family.into()), list);
     }
-    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-    ctx.set_fonts(fonts);
+    egui_phosphor::add_to_fonts(&mut font_defs, egui_phosphor::Variant::Regular);
+    fonts::install(ctx, font_defs);
 
     let mut v = egui::Visuals::dark();
     v.panel_fill = CHAT;
@@ -1368,6 +1663,7 @@ impl App {
         stream::spawn(frame_slot.clone(), streamer.clone(), cc.egui_ctx.clone());
         let vcfg: voice::SharedCfg = Arc::new(std::sync::Mutex::new(voice::VoiceCfg::load(&settings_path())));
         let meter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        net::init(vcfg.lock().unwrap().proxy.as_deref());
         let vtx = voice::spawn(evt_tx.clone(), cc.egui_ctx.clone(), streamer, vcfg.clone(), meter.clone());
         let mut app = Self {
             evt_tx,
@@ -1405,6 +1701,30 @@ impl App {
             voice_chat_open: false,
             call_fullscreen: false,
             vc_draft: String::new(),
+            join_open: false,
+            join_input: String::new(),
+            join_busy: false,
+            join_msg: None,
+            join_captcha_code: None,
+            pins: None,
+            search_query: String::new(),
+            search: None,
+            profile_pop: None,
+            last_ack: HashMap::new(),
+            webchat: None,
+            webchat_req: None,
+            web_call: false,
+            share_open: false,
+            share_sources: Vec::new(),
+            share_pick: 0,
+            share_height: 720,
+            share_fps: 30,
+            sharing: None,
+            live_key: None,
+            live_on_air: false,
+            live_note: String::new(),
+            preview: Arc::new(std::sync::Mutex::new(None)),
+            preview_tex: None,
             me_id: String::new(),
             vtx,
             in_voice: None,
@@ -1438,6 +1758,7 @@ impl App {
             meter,
             meter_val: 0.0,
             settings_open: false,
+            settings_tab: 1,
             devices: (Vec::new(), Vec::new()),
             recording_key: false,
             mic_testing: false,
@@ -1504,10 +1825,19 @@ impl App {
             match evt {
                 Evt::Voice(v) => match v {
                     voice::VoiceUi::Connecting => {
+                        tracing::info!("ui: voice phase -> Connecting");
                         self.voice_phase = VoicePhase::Connecting;
                         self.voice_note.clear();
                     }
-                    voice::VoiceUi::Connected => self.voice_phase = VoicePhase::Connected,
+                    voice::VoiceUi::Connected => {
+                        if self.voice_phase != VoicePhase::Connected {
+                            tracing::info!("ui: voice phase -> Connected");
+                        }
+                        // ignore late confirmations after leaving
+                        if self.in_voice.is_some() {
+                            self.voice_phase = VoicePhase::Connected;
+                        }
+                    }
                     voice::VoiceUi::Ended(why) => {
                         self.voice_phase = VoicePhase::Off;
                         // Don't leave us showing as "in the channel" to others if joining failed.
@@ -1533,10 +1863,24 @@ impl App {
                         self.stream_tex = None;
                         self.stream_note = why;
                     }
+                    voice::VoiceUi::LiveStarted => {
+                        self.live_on_air = true;
+                        if let (Some(key), Some(gw)) = (&self.live_key, &self.gw) {
+                            let _ = gw.send(json!({ "op": 22, "d": { "stream_key": key, "paused": false } }).to_string());
+                        }
+                    }
+                    voice::VoiceUi::LiveEnded(why) => {
+                        self.live_key = None;
+                        self.live_on_air = false;
+                        self.sharing = None;
+                        self.preview_tex = None;
+                        self.live_note = why;
+                    }
                     voice::VoiceUi::RemoteSpeaking(list) => self.remote_speaking = list,
                     voice::VoiceUi::SelfSpeaking(on) => self.self_speaking = on,
                 },
                 Evt::VoiceMember { channel, user, mut name, mut avatar, streaming, muted, deafened } => {
+                    fonts::check(ctx, &name);
                     if let Some((n, a)) = self.known_users.get(&user) {
                         name = n.clone();
                         avatar = a.clone();
@@ -1561,6 +1905,40 @@ impl App {
                         }
                     }
                 }
+                Evt::Pins(ch, r) => {
+                    if let Some(p) = self.pins.as_mut().filter(|p| p.0 == ch) {
+                        p.1 = Some(r);
+                    }
+                }
+                Evt::SearchResults(r) => {
+                    if self.search.is_some() {
+                        self.search = Some(Some(r));
+                    }
+                }
+                Evt::DmOpened(dm) => {
+                    if !self.dms.iter().any(|d| d.id == dm.id) {
+                        self.dms.insert(0, dm.clone());
+                    }
+                    self.view = View::Dms;
+                    let sel = Selected { id: dm.id.clone(), title: dm.name.clone(), guild: None, voice: false };
+                    self.open(ctx, sel);
+                }
+                Evt::JoinResult(r) => {
+                    self.join_busy = false;
+                    match r {
+                        Ok(name) => {
+                            self.join_msg = Some((format!("Joined {name}!"), false));
+                            self.join_input.clear();
+                            self.join_captcha_code = None;
+                        }
+                        Err((msg, captcha)) => {
+                            self.join_msg = Some((msg, true));
+                            if !captcha {
+                                self.join_captcha_code = None;
+                            }
+                        }
+                    }
+                }
                 Evt::Typing { channel, user, name } => {
                     let name = name
                         .or_else(|| self.known_users.get(&user).map(|k| k.0.clone()))
@@ -1576,6 +1954,7 @@ impl App {
                     apply_member_ops(rows, &ops, &roles);
                 }
                 Evt::UserInfo { user, name, avatar } => {
+                    fonts::check(ctx, &name);
                     for m in self.voice_members.values_mut().flatten().filter(|m| m.user == user) {
                         m.name = name.clone();
                         m.avatar = avatar.clone();
@@ -1584,6 +1963,18 @@ impl App {
                 }
                 Evt::Ready { me, me_id, me_avatar, guilds, dms } => {
                     self.status = "Connected".into();
+                    // Load fonts for any characters in names that can't be drawn yet.
+                    let mut all = me.clone();
+                    for g in &guilds {
+                        all.push_str(&g.name);
+                        for c in &g.channels {
+                            all.push_str(&c.name);
+                        }
+                    }
+                    for d in &dms {
+                        all.push_str(&d.name);
+                    }
+                    fonts::check(ctx, &all);
                     self.me_id = me_id;
                     self.me = me;
                     self.me_avatar = me_avatar;
@@ -1598,6 +1989,7 @@ impl App {
                     self.phase = Phase::Main;
                 }
                 Evt::GuildAdd(g) => {
+                    fonts::check(ctx, &(g.name.clone() + &g.channels.iter().map(|c| c.name.as_str()).collect::<String>()));
                     self.index_guild(&g);
                     match self.guilds.iter_mut().find(|x| x.id == g.id) {
                         Some(slot) => *slot = g,
@@ -1605,6 +1997,7 @@ impl App {
                     }
                 }
                 Evt::Message(ch, m) => {
+                    fonts::check(ctx, &(m.author.clone() + &m.content));
                     let author = m.author.clone();
                     if let Some(t) = self.typing.get_mut(&ch) {
                         t.retain(|x| x.1 != author);
@@ -1612,6 +2005,9 @@ impl App {
                     let avatar = m.avatar.clone();
                     let viewing = self.sel.as_ref().map(|s| s.id.as_str()) == Some(ch.as_str());
                     let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+                    if viewing && focused {
+                        self.ack(ch.clone(), m.id.clone());
+                    }
                     if m.pings_me && !(viewing && focused) {
                         if !viewing {
                             *self.mentions.entry(ch.clone()).or_default() += 1;
@@ -1697,6 +2093,10 @@ impl App {
                     }
                 }
                 Evt::History(ch, r) => {
+                    let last = r.as_ref().ok().and_then(|l| l.last()).map(|m| m.id.clone());
+                    if let (Some(id), true) = (last, self.sel.as_ref().map(|s| s.id.as_str()) == Some(ch.as_str())) {
+                        self.ack(ch.clone(), id);
+                    }
                     self.cache.insert(ch, r);
                 }
                 Evt::Status(s) => self.status = s,
@@ -1772,6 +2172,7 @@ impl App {
         self.mentions.remove(&id);
         self.reply_to = None;
         self.editing = None;
+        self.pins = None;
         if matches!(self.cache.get(&id), Some(Err(_))) {
             self.cache.remove(&id);
         }
@@ -1833,6 +2234,7 @@ impl App {
                 self.voice_note.clear();
             }
             VAction::Leave => {
+                self.stop_live();
                 if let Some((g, _, _)) = self.in_voice.take() {
                     self.send_voice_state(g.as_deref(), None);
                 }
@@ -1890,6 +2292,83 @@ impl App {
         }
     }
 
+    /// Native call bar for DM / group calls (people, streams and controls).
+    fn dm_call_strip(&mut self, ctx: &egui::Context, speaking: &HashSet<String>, vact: &mut Option<VAction>) {
+        let id = self.sel.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+        egui::TopBottomPanel::top("callstrip")
+            .resizable(true)
+            .frame(egui::Frame::none().fill(Color32::BLACK).inner_margin(12.0))
+            .show(ctx, |ui| {
+                self.stream_view(ui, vact);
+                if let Some((user, name)) = self.voice_tiles(ui, &id, speaking) {
+                    *vact = Some(VAction::Watch(format!("call:{id}:{user}"), user, name));
+                }
+                if self.live_key.is_some() {
+                    ui.horizontal(|ui| {
+                        let (txt, col) = if self.live_on_air { ("LIVE", RED) } else { ("Starting...", Color32::from_rgb(240, 178, 50)) };
+                        egui::Frame::none().fill(col).rounding(4.0).inner_margin(egui::Margin::symmetric(6.0, 1.0)).show(ui, |ui| {
+                            ui.label(RichText::new(txt).size(11.0).strong().family(semi()).color(Color32::WHITE));
+                        });
+                        ui.label(RichText::new("You're sharing your screen").color(TEXT));
+                        if let Some(t) = &self.preview_tex {
+                            let s = t.size_vec2() * (120.0 / t.size_vec2().x.max(1.0));
+                            ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), s)).rounding(4.0));
+                        }
+                    });
+                } else if !self.live_note.is_empty() {
+                    ui.label(RichText::new(&self.live_note).color(MUTED));
+                }
+                if self.vcfg.lock().unwrap().ptt {
+                    let k = voice::key_name(self.vcfg.lock().unwrap().ptt_key);
+                    ui.label(RichText::new(format!("Push to Talk: hold {k}")).size(12.0).color(MUTED));
+                }
+                ui.add_space(6.0);
+                let mut share_click = false;
+                let mut ring = false;
+                ui.horizontal(|ui| {
+                    ui.add_space(((ui.available_width() - 420.0) / 2.0).max(0.0));
+                    let mic_icon = if self.muted { icons::MICROPHONE_SLASH } else { icons::MICROPHONE };
+                    if call_button(ui, mic_icon, self.muted, if self.muted { "Unmute (Ctrl+Shift+M)" } else { "Mute (Ctrl+Shift+M)" }, true) {
+                        *vact = Some(VAction::ToggleMute);
+                    }
+                    if call_button(ui, icons::HEADPHONES, self.deaf, if self.deaf { "Undeafen" } else { "Deafen" }, true) {
+                        *vact = Some(VAction::ToggleDeaf);
+                    }
+                    ui.add_space(10.0);
+                    call_button(ui, icons::VIDEO_CAMERA_SLASH, false, "Camera isn't available in Rustcord yet", false);
+                    let live = self.live_key.is_some();
+                    if call_button(ui, icons::SCREENCAST, live, if live { "Stop Streaming" } else { "Share Your Screen" }, true) {
+                        share_click = true;
+                    }
+                    if call_button(ui, icons::BELL_RINGING, false, "Ring everyone in this chat", true) {
+                        ring = true;
+                    }
+                    ui.add_space(10.0);
+                    let leave = egui::Button::new(RichText::new(icons::PHONE_DISCONNECT).size(24.0).color(Color32::WHITE))
+                        .fill(RED)
+                        .min_size(Vec2::new(76.0, 48.0))
+                        .rounding(12.0);
+                    if ui.add(leave).on_hover_text("Disconnect").clicked() {
+                        *vact = Some(VAction::Leave);
+                    }
+                });
+                if share_click {
+                    if self.live_key.is_some() {
+                        self.stop_live();
+                    } else {
+                        self.share_sources = share::sources();
+                        self.share_pick = 0;
+                        self.share_open = true;
+                    }
+                }
+                if ring {
+                    if let Some(r) = &self.rest {
+                        let _ = r.send(Cmd::Ring(id.clone()));
+                    }
+                }
+            });
+    }
+
     fn speaking(&self) -> HashSet<String> {
         voice::speaking_set(&self.remote_speaking, Some(&self.me_id), self.self_speaking)
     }
@@ -1911,7 +2390,7 @@ impl App {
                 egui::Frame::none().fill(CHAT).rounding(8.0).inner_margin(32.0).show(ui, |ui| {
                     ui.set_width(440.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("Welcome back!").size(24.0).strong().color(BRIGHT));
+                        ui.label(RichText::new("Welcome back!").size(24.0).strong().family(semi()).color(BRIGHT));
                         ui.label(RichText::new("We're so excited to see you again!").color(MUTED));
                         ui.add_space(22.0);
                         if self.phase == Phase::Connecting || self.web_login_req {
@@ -1959,7 +2438,7 @@ impl App {
         let mut cancel = false;
         egui::TopBottomPanel::top("weblogin_bar").frame(egui::Frame::none().fill(RAIL).inner_margin(egui::Margin::symmetric(16.0, 10.0))).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{} discord.com", icons::LOCK_SIMPLE)).strong().color(GREEN));
+                ui.label(RichText::new(format!("{} discord.com", icons::LOCK_SIMPLE)).strong().family(semi()).color(GREEN));
                 ui.label(RichText::new("Sign in on Discord's own page. If a CAPTCHA appears, solve it here.").color(TEXT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Cancel").clicked() {
@@ -1970,7 +2449,8 @@ impl App {
             });
         });
         let area = egui::CentralPanel::default().frame(egui::Frame::none().fill(CHAT)).show(ctx, |ui| {
-            ui.centered_and_justified(|ui| ui.spinner());
+            // static (a spinner here would redraw the window non-stop behind the web view)
+                    ui.centered_and_justified(|ui| ui.label(RichText::new("Loading Discord...").color(MUTED)));
         });
         let rect = area.response.rect;
         if cancel {
@@ -1996,11 +2476,34 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
         let focus = self.call_fullscreen && self.sel.as_ref().map_or(false, |s| s.voice);
+        // Web chat is shown only for text channels and DMs, and never over popups.
+        let web_mode = self.vcfg.lock().unwrap().web_chat;
+        let overlay = self.settings_open || self.share_open || self.join_open || self.qs_open || self.msg_menu.is_some() || self.vol_popup.is_some();
+        // Voice channels always use Rustcord's own voice (it has the Drover UDP trick that works on
+        // networks that block Discord voice); web mode is for text chats and DMs.
+        // ...plus the chat panel of the voice channel you're in (the call itself stays native).
+        let web_on = web_mode
+            && !overlay
+            && self.sel.as_ref().map_or(false, |s| !s.voice || (self.voice_chat_open && self.in_voice.as_ref().map_or(false, |v| v.1 == s.id)));
+        if !web_on {
+            let in_call = self.web_call;
+            if let Some(w) = &mut self.webchat {
+                w.hide(in_call);
+            }
+            // Unused for a minute (and no call running in it): unload Discord's web app completely.
+            if !self.web_call && self.webchat.as_ref().map_or(false, |w| w.idle_too_long()) {
+                self.webchat = None;
+            } else if self.webchat.is_some() {
+                ctx.request_repaint_after(Duration::from_secs(5));
+            }
+        }
         let mut vact: Option<VAction> = None;
         let speaking = self.speaking();
 
         // ---- server rail ----
         let mut pick_view: Option<View> = None;
+
+        let mut open_join = false;
         egui::SidePanel::left("rail")
             .resizable(false)
             .exact_width(72.0)
@@ -2010,7 +2513,7 @@ impl App {
                     ui.spacing_mut().item_spacing.y = 8.0;
                     let dm_unread = self.dms.iter().any(|d| self.unread.contains(&d.id));
                     let dm_badge: u32 = self.dms.iter().filter_map(|d| self.mentions.get(&d.id)).sum();
-                    if rail_button(ui, self.view == View::Dms, dm_unread, dm_badge, None, "DM", "Direct Messages") {
+                    if rail_button(ui, self.view == View::Dms, dm_unread, dm_badge, None, "DM", "Direct Messages").clicked() {
                         pick_view = Some(View::Dms);
                     }
                     let (r, _) = ui.allocate_exact_size(Vec2::new(48.0, 2.0), Sense::hover());
@@ -2019,14 +2522,35 @@ impl App {
                         let unread = g.channels.iter().any(|c| self.unread.contains(&c.id));
                         let on = self.view == View::Guild(g.id.clone());
                         let badge: u32 = g.channels.iter().filter_map(|c| self.mentions.get(&c.id)).sum();
-                        if rail_button(ui, on, unread, badge, g.icon.as_deref(), &initials(&g.name), &g.name) {
+                        let r = rail_button(ui, on, unread, badge, g.icon.as_deref(), &initials(&g.name), "");
+                        // You're in voice in this server: small green speaker badge.
+                        if self.in_voice.as_ref().map_or(false, |v| v.0.as_deref() == Some(g.id.as_str())) {
+                            let c = r.rect.left_bottom() + Vec2::new(6.0, -6.0);
+                            ui.painter().circle_filled(c, 9.0, RAIL);
+                            ui.painter().circle_filled(c, 7.0, GREEN);
+                            ui.painter().text(c, Align2::CENTER_CENTER, icons::SPEAKER_HIGH, FontId::proportional(9.0), Color32::WHITE);
+                        }
+                        let r = r.on_hover_ui(|ui| self.server_card(ui, g));
+                        if r.clicked() {
                             pick_view = Some(View::Guild(g.id.clone()));
                         }
+                    }
+                    // Discord's green "+": join a server.
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
+                    let hovered = resp.hovered();
+                    ui.painter().rect_filled(rect, if hovered { 16.0 } else { 24.0 }, if hovered { GREEN } else { CHAT });
+                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, icons::PLUS, FontId::proportional(22.0), if hovered { Color32::WHITE } else { GREEN });
+                    if resp.on_hover_text("Join a Server").clicked() {
+                        open_join = true;
                     }
                 });
             });
         if let Some(v) = pick_view {
             self.view = v;
+        }
+        if open_join {
+            self.join_open = true;
+            self.join_msg = None;
         }
 
         // ---- channel / DM list, voice bar, user bar ----
@@ -2047,7 +2571,7 @@ impl App {
                                 avatar_ring(ui, &self.me_avatar, 32.0, speaking.contains(&self.me_id));
                             }
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(&self.me).strong().color(BRIGHT));
+                                ui.label(RichText::new(&self.me).strong().family(semi()).color(BRIGHT));
                                 let online = self.status == "Connected";
                                 ui.label(RichText::new(if online { "Online" } else { self.status.as_str() }).small().color(if online { GREEN } else { MUTED }));
                             });
@@ -2082,8 +2606,15 @@ impl App {
                                             VoicePhase::Connected => ("Voice Connected", GREEN),
                                             _ => ("Connecting...", Color32::from_rgb(240, 178, 50)),
                                         };
-                                        ui.label(RichText::new(txt).strong().color(col));
+                                        ui.label(RichText::new(txt).strong().family(semi()).color(col));
                                         ui.label(RichText::new(title).small().color(MUTED));
+                                        let (ptt, key) = {
+                                            let c = self.vcfg.lock().unwrap();
+                                            (c.ptt, c.ptt_key)
+                                        };
+                                        if ptt {
+                                            ui.label(RichText::new(format!("{}  Push to Talk: hold {}", icons::KEYBOARD, voice::key_name(key))).size(11.5).color(Color32::from_rgb(240, 178, 50)));
+                                        }
                                     });
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         let leave = egui::Button::new(RichText::new(icons::PHONE_DISCONNECT).size(16.0).color(Color32::WHITE)).fill(RED);
@@ -2104,7 +2635,7 @@ impl App {
                     View::Guild(gid) => self.guilds.iter().find(|g| &g.id == gid).map(|g| g.name.clone()).unwrap_or_default(),
                 };
                 egui::Frame::none().inner_margin(egui::Margin::symmetric(16.0, 14.0)).show(ui, |ui| {
-                    ui.label(RichText::new(title).strong().size(16.0).color(BRIGHT));
+                    ui.label(RichText::new(title).strong().family(semi()).size(16.0).color(BRIGHT));
                 });
                 ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, RAIL));
 
@@ -2128,7 +2659,7 @@ impl App {
                                     for c in &g.channels {
                                         if c.kind == 4 {
                                             ui.add_space(12.0);
-                                            ui.label(RichText::new(format!("{} {}", icons::CARET_DOWN, c.name.to_uppercase())).size(12.0).strong().color(MUTED));
+                                            ui.label(RichText::new(format!("{} {}", icons::CARET_DOWN, c.name.to_uppercase())).size(12.0).strong().family(semi()).color(MUTED));
                                             continue;
                                         }
                                         let on = sel_id.as_deref() == Some(c.id.as_str());
@@ -2139,12 +2670,12 @@ impl App {
                                         if c.is_voice() {
                                             for m in self.voice_members.get(&c.id).map(|v| v.as_slice()).unwrap_or(&[]) {
                                                 let (name, av) = self.member_face(m);
-                                                ui.horizontal(|ui| {
+                                                let row = ui.horizontal(|ui| {
                                                     ui.add_space(30.0);
                                                     avatar_ring(ui, av, 22.0, speaking.contains(&m.user));
                                                     ui.label(RichText::new(name).size(13.0).color(MUTED));
                                                     if m.streaming {
-                                                        ui.label(RichText::new(" LIVE ").size(10.0).strong().color(Color32::WHITE).background_color(RED));
+                                                        ui.label(RichText::new(" LIVE ").size(10.0).strong().family(semi()).color(Color32::WHITE).background_color(RED));
                                                     }
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                         ui.add_space(4.0);
@@ -2156,6 +2687,16 @@ impl App {
                                                         }
                                                     });
                                                 });
+                                                // Right-click someone in voice: mute / volume (only for you).
+                                                if m.user != self.me_id && row.response.hovered() && ui.input(|i| i.pointer.secondary_clicked()) {
+                                                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                                        let pick = (m.user.clone(), name.to_string(), pos);
+                                                        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("vol_click"), pick));
+                                                    }
+                                                }
+                                                if m.user.parse::<u64>().ok().and_then(|u| self.vcfg.lock().unwrap().user_vol.get(&u).copied()).map_or(false, |v| v <= 0.001) {
+                                                    ui.painter().text(row.response.rect.right_center() - Vec2::new(46.0, 0.0), Align2::RIGHT_CENTER, icons::SPEAKER_SLASH, FontId::proportional(13.0), RED);
+                                                }
                                             }
                                         }
                                     }
@@ -2182,6 +2723,9 @@ impl App {
             _ => false,
         };
         let mut toggle_members = false;
+        let mut toggle_web = false;
+        let mut toggle_pins = false;
+        let mut do_search = false;
         egui::TopBottomPanel::top("head")
             .frame(egui::Frame::none().fill(CHAT).inner_margin(egui::Margin::symmetric(16.0, 12.0)).stroke(Stroke::new(1.0_f32, RAIL)))
             .show_animated(ctx, !focus, |ui| {
@@ -2190,14 +2734,28 @@ impl App {
                         Some(sel) => {
                             let prefix = if sel.voice { icons::SPEAKER_HIGH } else if sel.guild.is_some() { icons::HASH } else { icons::AT };
                             ui.label(RichText::new(prefix).size(20.0).color(MUTED));
-                            ui.label(RichText::new(&sel.title).strong().size(16.0).color(BRIGHT));
+                            ui.label(RichText::new(&sel.title).strong().family(semi()).size(16.0).color(BRIGHT));
                         }
                         None => {
-                            ui.label(RichText::new("Rustcord").strong().size(16.0).color(BRIGHT));
+                            ui.label(RichText::new("Rustcord").strong().family(semi()).size(16.0).color(BRIGHT));
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(sel) = &self.sel {
+                            if !sel.voice && !web_mode {
+                                let f = ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_query)
+                                        .hint_text(format!("{}  Search", icons::MAGNIFYING_GLASS))
+                                        .desired_width(170.0),
+                                );
+                                if f.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.search_query.trim().is_empty() {
+                                    do_search = true;
+                                }
+                                let pc = if self.pins.is_some() { BRIGHT } else { MUTED };
+                                if ui.add(egui::Button::new(RichText::new(icons::PUSH_PIN).size(19.0).color(pc)).frame(false)).on_hover_text("Pinned Messages").clicked() {
+                                    toggle_pins = true;
+                                }
+                            }
                             if sel.guild.is_some() && !sel.voice {
                                 let c = if self.show_members { BRIGHT } else { MUTED };
                                 let b = egui::Button::new(RichText::new(icons::USERS).size(20.0).color(c)).frame(false);
@@ -2223,9 +2781,114 @@ impl App {
         if toggle_members {
             self.show_members = !self.show_members;
         }
+        if toggle_pins {
+            if self.pins.is_some() {
+                self.pins = None;
+            } else if let Some(sel) = &self.sel {
+                self.pins = Some((sel.id.clone(), None));
+                self.search = None;
+                if let Some(r) = &self.rest {
+                    let _ = r.send(Cmd::Pins(sel.id.clone()));
+                }
+            }
+        }
+        if do_search {
+            if let (Some(sel), Some(r)) = (&self.sel, &self.rest) {
+                let _ = r.send(Cmd::Search { guild: sel.guild.clone(), ch: sel.id.clone(), query: self.search_query.trim().to_string() });
+                self.search = Some(None);
+                self.pins = None;
+            }
+        }
+        if toggle_web {
+            let mut c = self.vcfg.lock().unwrap();
+            c.web_chat = !c.web_chat;
+            c.save(&settings_path());
+            let on = c.web_chat;
+            drop(c);
+            if !on {
+                self.webchat = None; // frees all of its memory (and ends any call in it)
+                self.web_call = false;
+            }
+        }
+
+        // ---- pinned messages / search results (right side) ----
+        let side_open = (self.pins.is_some() || self.search.is_some()) && !web_on && self.sel.as_ref().map_or(false, |s| !s.voice);
+        let mut jump: Option<String> = None;
+        let mut close_side = false;
+        if side_open {
+            egui::SidePanel::right("pins_search").resizable(false).exact_width(400.0).frame(egui::Frame::none().fill(SIDE).inner_margin(12.0)).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let title = if self.pins.is_some() { format!("{}  Pinned Messages", icons::PUSH_PIN) } else { format!("{}  Search Results", icons::MAGNIFYING_GLASS) };
+                    ui.label(RichText::new(title).strong().family(semi()).size(16.0).color(BRIGHT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new(RichText::new(icons::X).size(18.0).color(MUTED)).frame(false)).clicked() {
+                            close_side = true;
+                        }
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    if let Some((_, state)) = &self.pins {
+                        match state {
+                            None => {
+                                ui.spinner();
+                            }
+                            Some(Err(e)) => {
+                                ui.label(RichText::new(e).color(RED));
+                            }
+                            Some(Ok(list)) if list.is_empty() => {
+                                ui.label(RichText::new("This channel doesn't have any pinned messages... yet.").color(MUTED));
+                            }
+                            Some(Ok(list)) => {
+                                for m in list {
+                                    mini_message(ui, m);
+                                }
+                            }
+                        }
+                    } else if let Some(state) = &self.search {
+                        match state {
+                            None => {
+                                ui.spinner();
+                            }
+                            Some(Err(e)) => {
+                                ui.label(RichText::new(e).color(RED));
+                            }
+                            Some(Ok((hits, total))) => {
+                                ui.label(RichText::new(format!("{total} results")).size(12.0).color(MUTED));
+                                for (ch, m) in hits {
+                                    let cname = self.guilds.iter().flat_map(|g| g.channels.iter()).find(|c| &c.id == ch).map(|c| format!("# {}", c.name)).unwrap_or_default();
+                                    if !cname.is_empty() {
+                                        ui.add_space(6.0);
+                                        ui.label(RichText::new(cname).size(12.0).strong().family(semi()).color(MUTED));
+                                    }
+                                    let resp = egui::Frame::none().fill(CHAT).rounding(6.0).inner_margin(6.0).show(ui, |ui| mini_message(ui, m)).response.interact(Sense::click());
+                                    if resp.on_hover_text("Jump to channel").clicked() {
+                                        jump = Some(ch.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        }
+        if close_side {
+            self.pins = None;
+            self.search = None;
+        }
+        if let Some(ch) = jump {
+            let guild = self.chan_guild.get(&ch).cloned();
+            let title = self.guilds.iter().flat_map(|g| g.channels.iter()).find(|c| c.id == ch).map(|c| c.name.clone())
+                .or_else(|| self.dms.iter().find(|d| d.id == ch).map(|d| d.name.clone()))
+                .unwrap_or_default();
+            if let Some(g) = &guild {
+                self.view = View::Guild(g.clone());
+            }
+            self.open(ctx, Selected { id: ch, title, guild, voice: false });
+        }
 
         // ---- member list (right side, server text channels) ----
-        let member_guild = self.sel.as_ref().filter(|s| !s.voice && self.show_members).and_then(|s| s.guild.clone());
+        let member_guild = self.sel.as_ref().filter(|s| !s.voice && self.show_members && !web_on && !side_open).and_then(|s| s.guild.clone());
         if let Some(rows) = member_guild.as_ref().and_then(|g| self.member_lists.get(g)) {
             egui::SidePanel::right("members")
                 .resizable(false)
@@ -2238,7 +2901,7 @@ impl App {
                             match row {
                                 ListRow::Group { name, count } => {
                                     ui.add_space(14.0);
-                                    ui.label(RichText::new(format!("  {} — {count}", name.to_uppercase())).size(12.0).strong().color(MUTED));
+                                    ui.label(RichText::new(format!("  {} — {count}", name.to_uppercase())).size(12.0).strong().family(semi()).color(MUTED));
                                     ui.add_space(2.0);
                                 }
                                 ListRow::Member { name, avatar, status, color } => member_list_row(ui, name, avatar, status, *color),
@@ -2248,11 +2911,39 @@ impl App {
                 });
         }
 
+        // ---- Discord web app (official client): text chats and DMs ----
+        if web_on {
+            if let Some((guild, id)) = self.sel.as_ref().filter(|s| !s.voice).map(|s| (s.guild.clone(), s.id.clone())) {
+                // DM / group calls run natively in Rustcord (Drover voice), above Discord's chat.
+                if in_this_voice {
+                    self.dm_call_strip(ctx, &speaking, &mut vact);
+                }
+                let url = webchat::channel_url(guild.as_deref(), &id);
+                let area = egui::CentralPanel::default().frame(egui::Frame::none().fill(CHAT)).show(ctx, |ui| {
+                    // static (a spinner here would redraw the window non-stop behind the web view)
+                    ui.centered_and_justified(|ui| ui.label(RichText::new("Loading Discord...").color(MUTED)));
+                });
+                ctx.request_repaint_after(Duration::from_millis(500)); // drives the memory trimming
+                let in_call = self.web_call;
+                match &mut self.webchat {
+                    Some(w) => {
+                        // In a native call: only the chat from Discord's page (no web call screen).
+                        w.set_voice(in_this_voice);
+                        w.show(area.response.rect, &url, in_call)
+                    }
+                    None => self.webchat_req = Some(url),
+                }
+                self.apply_voice(vact);
+                return;
+            }
+        }
+
         // ---- voice channel page ----
         if let Some(sel) = self.sel.as_ref().filter(|s| s.voice) {
             let (guild, id, title) = (sel.guild.clone(), sel.id.clone(), sel.title.clone());
             if in_this_voice {
                 let mut toggle_chat = false;
+                let mut share_click = false;
                 let mut toggle_full = false;
                 // Discord-style control bar.
                 egui::TopBottomPanel::bottom("callbar")
@@ -2269,7 +2960,10 @@ impl App {
                             }
                             ui.add_space(10.0);
                             call_button(ui, icons::VIDEO_CAMERA_SLASH, false, "Camera isn't available in Rustcord yet", false);
-                            call_button(ui, icons::SCREENCAST, false, "Sharing your screen isn't available in Rustcord yet", false);
+                            let live = self.live_key.is_some();
+                            if call_button(ui, icons::SCREENCAST, live, if live { "Stop Streaming" } else { "Share Your Screen" }, true) {
+                                share_click = true;
+                            }
                             if call_button(ui, icons::CHAT_CIRCLE_TEXT, self.voice_chat_open, "Voice channel chat", true) {
                                 toggle_chat = true;
                             }
@@ -2290,14 +2984,66 @@ impl App {
                         });
                     });
                 if self.voice_chat_open {
-                    self.voice_chat_panel(ctx, &id, &title, guild.as_deref());
+                    if web_on {
+                        // Voice channel chat through Discord's web app; the call stays in Rustcord.
+                        let url = webchat::channel_url(guild.as_deref(), &id);
+                        let panel = egui::SidePanel::right("vchat_web").resizable(true).default_width(420.0).frame(egui::Frame::none().fill(CHAT)).show(ctx, |ui| {
+                            ui.centered_and_justified(|ui| ui.label(RichText::new("Loading Discord...").color(MUTED)));
+                        });
+                        ctx.request_repaint_after(Duration::from_millis(500));
+                        match &mut self.webchat {
+                            Some(w) => {
+                                w.set_voice(true);
+                                w.show(panel.response.rect, &url, false)
+                            }
+                            None => self.webchat_req = Some(url),
+                        }
+                    } else {
+                        self.voice_chat_panel(ctx, &id, &title, guild.as_deref());
+                    }
                 }
                 egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::BLACK).inner_margin(16.0)).show(ctx, |ui| {
+                    if self.live_key.is_some() {
+                        ui.horizontal(|ui| {
+                            egui::Frame::none().fill(INPUT).rounding(8.0).inner_margin(8.0).show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Your Stream").strong().family(semi()).color(BRIGHT));
+                                        let (txt, col) = if self.live_on_air { ("LIVE", RED) } else { ("Starting...", Color32::from_rgb(240, 178, 50)) };
+                                        egui::Frame::none().fill(col).rounding(4.0).inner_margin(egui::Margin::symmetric(6.0, 1.0)).show(ui, |ui| {
+                                            ui.label(RichText::new(txt).size(11.0).strong().family(semi()).color(Color32::WHITE));
+                                        });
+                                    });
+                                    match &self.preview_tex {
+                                        Some(t) => {
+                                            let s = t.size_vec2() * (240.0 / t.size_vec2().x.max(1.0));
+                                            ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), s)).rounding(6.0));
+                                        }
+                                        None => {
+                                            ui.spinner();
+                                        }
+                                    }
+                                });
+                            });
+                        });
+                        ui.add_space(10.0);
+                    } else if !self.live_note.is_empty() {
+                        ui.label(RichText::new(&self.live_note).color(MUTED));
+                    }
                     self.stream_view(ui, &mut vact);
                     if let (Some((user, name)), Some(g)) = (self.voice_tiles(ui, &id, &speaking), guild.as_ref()) {
                         vact = Some(VAction::Watch(format!("guild:{g}:{id}:{user}"), user, name));
                     }
                 });
+                if share_click {
+                    if self.live_key.is_some() {
+                        self.stop_live();
+                    } else {
+                        self.share_sources = share::sources();
+                        self.share_pick = 0;
+                        self.share_open = true;
+                    }
+                }
                 if toggle_chat {
                     self.voice_chat_open = !self.voice_chat_open;
                     if self.voice_chat_open {
@@ -2313,13 +3059,13 @@ impl App {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ui.available_height() / 4.0);
                         ui.label(RichText::new(icons::SPEAKER_HIGH).size(52.0).color(MUTED));
-                        ui.label(RichText::new(&title).size(22.0).strong().color(BRIGHT));
+                        ui.label(RichText::new(&title).size(22.0).strong().family(semi()).color(BRIGHT));
                         ui.add_space(6.0);
                         let n = self.voice_members.get(&id).map_or(0, |v| v.len());
                         let who = if n == 0 { "No one is here yet.".to_string() } else { format!("{n} in voice") };
                         ui.label(RichText::new(who).color(MUTED));
                         ui.add_space(14.0);
-                        let join = egui::Button::new(RichText::new("Join Voice").strong().color(Color32::WHITE)).fill(GREEN).min_size(Vec2::new(160.0, 38.0)).rounding(4.0);
+                        let join = egui::Button::new(RichText::new("Join Voice").strong().family(semi()).color(Color32::WHITE)).fill(GREEN).min_size(Vec2::new(160.0, 38.0)).rounding(4.0);
                         if ui.add(join).clicked() {
                             vact = Some(VAction::Join(guild.clone(), id.clone(), title.clone()));
                         }
@@ -2333,25 +3079,7 @@ impl App {
         }
         // ---- DM call strip ----
         if in_this_voice {
-            let id = self.sel.as_ref().map(|s| s.id.clone()).unwrap_or_default();
-            egui::TopBottomPanel::top("callstrip")
-                .frame(egui::Frame::none().fill(Color32::from_rgb(17, 18, 20)).inner_margin(12.0))
-                .show(ctx, |ui| {
-                    self.stream_view(ui, &mut vact);
-                    if let Some((user, name)) = self.voice_tiles(ui, &id, &speaking) {
-                        vact = Some(VAction::Watch(format!("call:{id}:{user}"), user, name));
-                    }
-                    ui.horizontal(|ui| {
-                        let mic = if self.muted { "🎙 Unmute" } else { "🎙 Mute" };
-                        if ui.button(mic).clicked() {
-                            vact = Some(VAction::ToggleMute);
-                        }
-                        let deaf = if self.deaf { "🎧 Undeafen" } else { "🎧 Deafen" };
-                        if ui.button(deaf).clicked() {
-                            vact = Some(VAction::ToggleDeaf);
-                        }
-                    });
-                });
+            self.dm_call_strip(ctx, &speaking, &mut vact);
         }
 
         // ---- composer ----
@@ -2480,13 +3208,29 @@ impl App {
                         });
                     });
                     // "Someone is typing..." line under the box, like Discord.
-                    ui.add_sized([ui.available_width(), 18.0], egui::Label::new(RichText::new(&typing_text).size(12.5).strong().color(TEXT)));
+                    ui.add_sized([ui.available_width(), 18.0], egui::Label::new(RichText::new(&typing_text).size(12.5).strong().family(semi()).color(TEXT)));
                 });
         }
 
         // ---- messages ----
         let mut action: Option<MsgAction> = None;
         let mut open_menu: Option<(String, String, egui::Pos2)> = None;
+        let mut open_profile: Option<(String, String, String, egui::Pos2)> = None;
+        // Name colour = the author's highest coloured role, like Discord.
+        let (role_col, role_pos) = self
+            .sel
+            .as_ref()
+            .and_then(|s| s.guild.as_ref())
+            .and_then(|gid| self.guilds.iter().find(|g| &g.id == gid))
+            .map(|g| (g.roles.clone(), g.role_pos.clone()))
+            .unwrap_or_default();
+        let name_col = |roles: &[String]| -> Color32 {
+            roles
+                .iter()
+                .filter_map(|r| role_col.get(r).and_then(|x| x.1).map(|c| (role_pos.get(r).copied().unwrap_or(0), c)))
+                .max_by_key(|x| x.0)
+                .map_or(BRIGHT, |x| x.1)
+        };
         egui::CentralPanel::default().frame(egui::Frame::none().fill(CHAT)).show(ctx, |ui| {
             let Some(sel) = &self.sel else {
                 ui.centered_and_justified(|ui| ui.label(RichText::new("Pick a server and a channel, or a friend.").color(MUTED)));
@@ -2532,14 +3276,17 @@ impl App {
                                     ui.horizontal(|ui| {
                                         ui.add_space(36.0);
                                         ui.label(RichText::new("╭").color(MUTED));
-                                        ui.label(RichText::new(format!("@{who}")).size(13.0).strong().color(MUTED));
+                                        ui.label(RichText::new(format!("@{who}")).size(13.0).strong().family(semi()).color(MUTED));
                                         ui.label(RichText::new(text).size(13.0).color(MUTED));
                                     });
                                 }
                                 ui.horizontal_top(|ui| {
                                     ui.add_space(16.0);
                                     if first {
-                                        ui.add(egui::Image::new(m.avatar.as_str()).fit_to_exact_size(Vec2::splat(40.0)).rounding(20.0));
+                                        let a = ui.add(egui::Image::new(m.avatar.as_str()).fit_to_exact_size(Vec2::splat(40.0)).rounding(20.0).sense(Sense::click()));
+                                        if a.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                            open_profile = Some((m.author_id.clone(), m.author.clone(), m.avatar.clone(), ui.input(|i| i.pointer.interact_pos()).unwrap_or_default()));
+                                        }
                                     } else {
                                         ui.add_space(40.0);
                                     }
@@ -2548,7 +3295,10 @@ impl App {
                                         ui.set_max_width(ui.available_width() - 16.0);
                                         if first {
                                             ui.horizontal(|ui| {
-                                                ui.label(RichText::new(&m.author).strong().size(15.5).color(BRIGHT));
+                                                let n = ui.add(egui::Label::new(RichText::new(&m.author).strong().family(semi()).size(15.5).color(name_col(&m.roles))).sense(Sense::click()));
+                                                if n.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                                    open_profile = Some((m.author_id.clone(), m.author.clone(), m.avatar.clone(), ui.input(|i| i.pointer.interact_pos()).unwrap_or_default()));
+                                                }
                                                 ui.label(RichText::new(&m.time).size(12.0).color(MUTED));
                                             });
                                         }
@@ -2573,7 +3323,7 @@ impl App {
                                                                     ui.label(RichText::new(&r.label).size(15.0));
                                                                 }
                                                             }
-                                                            ui.label(RichText::new(r.count.to_string()).size(13.0).strong().color(if r.me { BRIGHT } else { MUTED }));
+                                                            ui.label(RichText::new(r.count.to_string()).size(13.0).strong().family(semi()).color(if r.me { BRIGHT } else { MUTED }));
                                                         });
                                                     });
                                                     let chip = chip.response.interact(Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -2621,6 +3371,9 @@ impl App {
         if let Some(m) = open_menu {
             self.msg_menu = Some(m);
         }
+        if let Some(p) = open_profile {
+            self.profile_pop = Some(p);
+        }
         self.message_menu(ctx, &mut action);
         if let Some(a) = action {
             self.apply_msg_action(ctx, a);
@@ -2665,6 +3418,9 @@ impl App {
             self.qs_open = false;
             self.emoji_open = false;
             self.vol_popup = None;
+            self.profile_pop = None;
+            self.share_open = false;
+            self.join_open = false;
             if self.call_fullscreen {
                 self.call_fullscreen = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -2680,7 +3436,7 @@ impl App {
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             egui::Area::new(egui::Id::new("drop_hint")).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).order(egui::Order::Foreground).show(ctx, |ui| {
                 egui::Frame::none().fill(ACCENT).rounding(12.0).inner_margin(28.0).show(ui, |ui| {
-                    ui.label(RichText::new("Drop to upload").size(22.0).strong().color(Color32::WHITE));
+                    ui.label(RichText::new("Drop to upload").size(22.0).strong().family(semi()).color(Color32::WHITE));
                 });
             });
         }
@@ -2715,7 +3471,7 @@ impl App {
             .fixed_size([540.0, 0.0])
             .frame(egui::Frame::window(&ctx.style()).fill(SIDE).rounding(8.0).inner_margin(16.0))
             .show(ctx, |ui| {
-                ui.label(RichText::new("Where would you like to go?").size(18.0).strong().color(BRIGHT));
+                ui.label(RichText::new("Where would you like to go?").size(18.0).strong().family(semi()).color(BRIGHT));
                 ui.add_space(6.0);
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut self.qs_query)
@@ -2749,6 +3505,268 @@ impl App {
         }
     }
 
+    /// Mark a channel read up to `id` (at most every 3 s per channel).
+    fn ack(&mut self, ch: String, id: String) {
+        if self.last_ack.get(&ch).map_or(false, |t| t.elapsed() < Duration::from_secs(3)) {
+            return;
+        }
+        self.last_ack.insert(ch.clone(), Instant::now());
+        if let Some(r) = &self.rest {
+            let _ = r.send(Cmd::Ack(ch, id));
+        }
+    }
+
+    /// Discord-style profile card when you click someone's picture or name.
+    fn profile_popout(&mut self, ctx: &egui::Context) {
+        let Some((user, name, avatar, pos)) = self.profile_pop.clone() else { return };
+        let mut message = false;
+        let area = egui::Area::new(egui::Id::new("profile_pop")).fixed_pos(pos + Vec2::new(8.0, 0.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).fill(RAIL).rounding(8.0).inner_margin(0.0).show(ui, |ui| {
+                ui.set_width(300.0);
+                let (banner, _) = ui.allocate_exact_size(Vec2::new(300.0, 60.0), Sense::hover());
+                ui.painter().rect_filled(banner, egui::Rounding { nw: 8.0, ne: 8.0, sw: 0.0, se: 0.0 }, colorful(&user));
+                let face = Rect::from_min_size(banner.left_bottom() + Vec2::new(16.0, -40.0), Vec2::splat(80.0));
+                ui.painter().circle_filled(face.center(), 44.0, RAIL);
+                egui::Image::new(avatar.as_str()).rounding(40.0).paint_at(ui, face);
+                ui.add_space(46.0);
+                egui::Frame::none().inner_margin(egui::Margin::symmetric(16.0, 8.0)).show(ui, |ui| {
+                    ui.label(RichText::new(&name).size(20.0).strong().family(semi()).color(BRIGHT));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("ID {user}")).size(12.0).color(MUTED));
+                        if ui.small_button(icons::COPY).on_hover_text("Copy user ID").clicked() {
+                            ui.output_mut(|o| o.copied_text = user.clone());
+                        }
+                    });
+                    if user != self.me_id {
+                        ui.add_space(8.0);
+                        let b = egui::Button::new(RichText::new(format!("{}  Message", icons::CHAT_CIRCLE)).color(Color32::WHITE)).fill(ACCENT).min_size(Vec2::new(268.0, 34.0));
+                        if ui.add(b).clicked() {
+                            message = true;
+                        }
+                    }
+                    ui.add_space(4.0);
+                });
+            });
+        });
+        if message {
+            if let Some(r) = &self.rest {
+                let _ = r.send(Cmd::OpenDm(user.clone()));
+            }
+            self.profile_pop = None;
+            return;
+        }
+        let outside = ctx.input(|i| i.pointer.any_pressed())
+            && ctx.input(|i| i.pointer.interact_pos()).map_or(false, |p| !area.response.rect.contains(p) && p != pos);
+        if outside {
+            self.profile_pop = None;
+        }
+    }
+
+    /// "Join a Server": paste an invite link or code.
+    fn join_window(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let mut join = false;
+        let mut open_in_discord = None;
+        egui::Window::new(RichText::new("Join a Server").size(20.0).strong().family(semi()).color(BRIGHT))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([440.0, 0.0])
+            .frame(egui::Frame::window(&ctx.style()).fill(CHAT).rounding(8.0).inner_margin(20.0))
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Enter an invite below to join an existing server.").color(MUTED));
+                ui.add_space(10.0);
+                ui.label(RichText::new("INVITE LINK *").size(12.0).strong().family(semi()).color(MUTED));
+                let f = ui.add(
+                    egui::TextEdit::singleline(&mut self.join_input)
+                        .hint_text("https://discord.gg/hTKzmak")
+                        .desired_width(f32::INFINITY)
+                        .font(FontId::proportional(15.0)),
+                );
+                if f.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    join = true;
+                }
+                ui.label(RichText::new("Invites look like: hTKzmak, https://discord.gg/hTKzmak, https://discord.gg/cool-people").size(12.0).color(MUTED));
+                if let Some((msg, bad)) = &self.join_msg {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(msg).color(if *bad { RED } else { GREEN }));
+                }
+                if let Some(code) = &self.join_captcha_code {
+                    if self.join_msg.as_ref().map_or(false, |m| m.1) {
+                        ui.label(RichText::new("Open the invite in Discord to solve the CAPTCHA there; the server then appears here too.").size(12.0).color(MUTED));
+                        if ui.button(format!("{}  Open invite in Discord", icons::ARROW_SQUARE_OUT)).clicked() {
+                            open_in_discord = Some(code.clone());
+                        }
+                    }
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if self.join_busy {
+                        ui.spinner();
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let b = egui::Button::new(RichText::new("Join Server").color(Color32::WHITE)).fill(ACCENT).min_size(Vec2::new(120.0, 36.0));
+                        if ui.add_enabled(!self.join_busy, b).clicked() {
+                            join = true;
+                        }
+                    });
+                });
+            });
+        if !open {
+            self.join_open = false;
+        }
+        if let Some(code) = open_in_discord {
+            let _ = std::process::Command::new("explorer.exe").arg(format!("https://discord.gg/{code}")).spawn();
+        }
+        if join && !self.join_busy {
+            match invite_code(&self.join_input) {
+                Some(code) => {
+                    self.join_busy = true;
+                    self.join_msg = None;
+                    self.join_captcha_code = Some(code.clone());
+                    if let Some(r) = &self.rest {
+                        let _ = r.send(Cmd::JoinInvite(code));
+                    }
+                }
+                None => self.join_msg = Some(("Please enter a valid invite link or code.".into(), true)),
+            }
+        }
+    }
+
+    /// Hover card for a server icon: its name and who is in each voice channel (like Discord).
+    fn server_card(&self, ui: &mut egui::Ui, g: &Guild) {
+        ui.set_max_width(280.0);
+        ui.label(RichText::new(&g.name).strong().family(semi()).size(15.0).color(BRIGHT));
+        let mut any = false;
+        for c in g.channels.iter().filter(|c| c.is_voice()) {
+            let Some(members) = self.voice_members.get(&c.id).filter(|m| !m.is_empty()) else { continue };
+            any = true;
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(icons::SPEAKER_HIGH).color(GREEN));
+                ui.label(RichText::new(&c.name).strong().family(semi()).color(TEXT));
+                ui.label(RichText::new(format!("· {}", members.len())).size(12.0).color(MUTED));
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                for m in members.iter().take(10) {
+                    let (_, av) = self.member_face(m);
+                    avatar_ring(ui, av, 22.0, false);
+                }
+                if members.len() > 10 {
+                    ui.label(RichText::new(format!("+{}", members.len() - 10)).size(12.0).color(MUTED));
+                }
+            });
+            let names: Vec<&str> = members.iter().take(6).map(|m| self.member_face(m).0).collect();
+            let more = if members.len() > 6 { format!(" and {} more", members.len() - 6) } else { String::new() };
+            ui.label(RichText::new(format!("{}{more}", names.join(", "))).size(12.0).color(MUTED));
+            if members.iter().any(|m| m.streaming) {
+                ui.label(RichText::new(format!("{}  Someone is live", icons::BROADCAST)).size(12.0).color(RED));
+            }
+        }
+        if !any {
+            ui.label(RichText::new("No one is in voice").size(12.0).color(MUTED));
+        }
+    }
+
+    /// Go live with the source picked in the share window.
+    fn start_live(&mut self, ctx: &egui::Context) {
+        let Some((guild, channel, _)) = self.in_voice.clone() else { return };
+        let Some(src) = self.share_sources.get(self.share_pick).cloned() else { return };
+        let (w, h) = share::target_size(src.width, src.height, self.share_height);
+        let fps = self.share_fps;
+        songbird::video::set_sending(true, w, h, fps, share::bitrate_for(w, h, fps));
+        self.sharing = Some(share::start(src.source.clone(), w, h, fps, self.preview.clone(), ctx.clone()));
+        let key = match &guild {
+            Some(g) => format!("guild:{g}:{channel}:{}", self.me_id),
+            None => format!("call:{channel}:{}", self.me_id),
+        };
+        if let Some(gw) = &self.gw {
+            let kind = if guild.is_some() { "guild" } else { "call" };
+            let p = json!({ "op": 18, "d": { "type": kind, "guild_id": guild, "channel_id": channel, "preferred_region": null } });
+            let _ = gw.send(p.to_string());
+        }
+        tracing::info!("ui: going live {key} at {w}x{h} {fps}fps");
+        let _ = self.vtx.send(voice::VoiceMsg::GoLive { key: key.clone() });
+        self.live_key = Some(key);
+        self.live_on_air = false;
+        self.live_note.clear();
+        self.share_open = false;
+        self.join_open = false;
+    }
+
+    fn stop_live(&mut self) {
+        if let Some(key) = self.live_key.take() {
+            if let Some(gw) = &self.gw {
+                let _ = gw.send(json!({ "op": 19, "d": { "stream_key": key } }).to_string());
+            }
+            let _ = self.vtx.send(voice::VoiceMsg::StopLive);
+        }
+        self.sharing = None;
+        self.live_on_air = false;
+        self.preview_tex = None;
+    }
+
+    /// Discord-style "Screen Share" window: what to share + quality.
+    fn share_picker(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let mut go = false;
+        egui::Window::new(RichText::new("Screen Share").size(20.0).strong().family(semi()).color(BRIGHT))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([540.0, 0.0])
+            .frame(egui::Frame::window(&ctx.style()).fill(CHAT).rounding(8.0).inner_margin(20.0))
+            .show(ctx, |ui| {
+                ui.label(RichText::new("CHOOSE WHAT TO SHARE").size(12.0).strong().family(semi()).color(MUTED));
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    if self.share_sources.is_empty() {
+                        ui.label(RichText::new("No screens or windows found.").color(MUTED));
+                    }
+                    for (i, s) in self.share_sources.iter().enumerate() {
+                        let icon = match s.source {
+                            share::Source::Monitor(_) => icons::MONITOR,
+                            share::Source::Window(_) => icons::APP_WINDOW,
+                        };
+                        let text = RichText::new(format!("{icon}  {}    {}×{}", s.label, s.width, s.height)).size(14.0);
+                        ui.selectable_value(&mut self.share_pick, i, text);
+                    }
+                });
+                ui.add_space(12.0);
+                ui.label(RichText::new("STREAM QUALITY").size(12.0).strong().family(semi()).color(MUTED));
+                ui.horizontal(|ui| {
+                    ui.label("Resolution");
+                    ui.radio_value(&mut self.share_height, 720, "720p");
+                    ui.radio_value(&mut self.share_height, 1080, "1080p");
+                    ui.radio_value(&mut self.share_height, 1440, "Source");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Frame Rate");
+                    ui.radio_value(&mut self.share_fps, 15, "15 FPS");
+                    ui.radio_value(&mut self.share_fps, 30, "30 FPS");
+                    ui.radio_value(&mut self.share_fps, 60, "60 FPS");
+                });
+                ui.label(RichText::new("Discord may limit 1080p, Source and 60 FPS to Nitro. Sound isn't shared yet. Higher settings use more CPU.").size(12.0).color(MUTED));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let b = egui::Button::new(RichText::new(format!("{}  Go Live", icons::BROADCAST)).size(15.0).color(Color32::WHITE)).fill(ACCENT).min_size(Vec2::new(140.0, 38.0));
+                    if ui.add_enabled(!self.share_sources.is_empty() && self.in_voice.is_some(), b).clicked() {
+                        go = true;
+                    }
+                });
+            });
+        if !open {
+            self.share_open = false;
+            self.join_open = false;
+        }
+        if go {
+            self.start_live(ctx);
+        }
+    }
+
     /// Load a channel's messages (and subscribe to its live updates) without leaving the call.
     fn load_chat(&mut self, ch: &str, guild: Option<&str>) {
         if matches!(self.cache.get(ch), Some(Err(_))) {
@@ -2776,7 +3794,7 @@ impl App {
                 egui::TopBottomPanel::top("vchat_head").frame(egui::Frame::none().fill(CHAT).inner_margin(12.0)).show_inside(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(icons::CHAT_CIRCLE_TEXT).size(18.0).color(MUTED));
-                        ui.label(RichText::new(title).strong().color(BRIGHT));
+                        ui.label(RichText::new(title).strong().family(semi()).color(BRIGHT));
                     });
                 });
                 egui::TopBottomPanel::bottom("vchat_composer").frame(egui::Frame::none().fill(CHAT).inner_margin(10.0)).show_inside(ui, |ui| {
@@ -2826,7 +3844,7 @@ impl App {
                                         ui.set_max_width(ui.available_width() - 8.0);
                                         if first {
                                             ui.horizontal(|ui| {
-                                                ui.label(RichText::new(&m.author).strong().color(BRIGHT));
+                                                ui.label(RichText::new(&m.author).strong().family(semi()).color(BRIGHT));
                                                 ui.label(RichText::new(&m.short).size(11.0).color(MUTED));
                                             });
                                         }
@@ -2874,19 +3892,55 @@ impl App {
         let mut c = before.clone();
         let mut open = true;
         let mut toggle_test = false;
-        egui::Window::new(RichText::new("Voice & Video").size(20.0).strong().color(BRIGHT))
-            .open(&mut open)
-            .collapsible(false)
+        let tab = self.settings_tab;
+        let mut new_tab = tab;
+        let mut log_out = false;
+        let screen = ctx.screen_rect();
+        let tabs = [(0u8, "My Account"), (1, "Voice & Video"), (2, "Connection"), (3, "Keybinds"), (4, "Advanced")];
+        // Full-window settings like Discord's: menu on the left, content in the middle.
+        let side_w = (screen.width() * 0.32).clamp(220.0, 420.0);
+        egui::SidePanel::left("settings_nav")
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size([600.0, 0.0])
-            .frame(egui::Frame::window(&ctx.style()).fill(CHAT).rounding(8.0).inner_margin(20.0))
+            .exact_width(side_w)
+            .frame(egui::Frame::none().fill(SIDE).inner_margin(egui::Margin { left: (side_w - 232.0).max(12.0), right: 12.0, top: 60.0, bottom: 12.0 }))
             .show(ctx, |ui| {
+                    ui.set_width(218.0);
+                    ui.label(RichText::new("USER SETTINGS").size(12.0).strong().family(semi()).color(MUTED));
+                    ui.add_space(4.0);
+                    for (t, name) in tabs {
+                        let on = tab == t;
+                        let b = egui::Button::new(RichText::new(name).size(15.0).color(if on { BRIGHT } else { MUTED })).fill(if on { ACTIVE } else { SIDE }).min_size(Vec2::new(200.0, 32.0));
+                        if ui.add(b).clicked() {
+                            new_tab = t;
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.separator();
+                    let lo = egui::Button::new(RichText::new(format!("{}  Log Out", icons::SIGN_OUT)).size(15.0).color(RED)).fill(SIDE).min_size(Vec2::new(200.0, 32.0));
+                    if ui.add(lo).clicked() {
+                        log_out = true;
+                    }
+                    });
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(CHAT)).show(ctx, |ui| {
+                egui::ScrollArea::vertical().id_salt("settings_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    egui::Frame::none().inner_margin(egui::Margin { left: 40.0, right: 40.0, top: 60.0, bottom: 40.0 }).show(ui, |ui| {
+                        ui.set_max_width(660.0);
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.horizontal(|ui| {
+                            let title = tabs.iter().find(|x| x.0 == tab).map(|x| x.1).unwrap_or("");
+                            ui.label(RichText::new(title).size(20.0).strong().family(semi()).color(BRIGHT));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(egui::Button::new(RichText::new(icons::X_CIRCLE).size(30.0).color(MUTED)).frame(false)).on_hover_text("Close (Esc)").clicked() {
+                                    open = false;
+                                }
+                            });
+                        });
                 let section = |ui: &mut egui::Ui, t: &str| {
                     ui.add_space(14.0);
-                    ui.label(RichText::new(t.to_uppercase()).size(12.0).strong().color(MUTED));
+                    ui.label(RichText::new(t.to_uppercase()).size(12.0).strong().family(semi()).color(MUTED));
                     ui.add_space(4.0);
                 };
+                if tab == 1 {
                 ui.columns(2, |cols| {
                     section(&mut cols[0], "Input Device");
                     egui::ComboBox::from_id_salt("in_dev")
@@ -2939,7 +3993,7 @@ impl App {
                         let key = if self.recording_key { "Press any key or mouse button...".to_string() } else { voice::key_name(c.ptt_key) };
                         egui::Frame::none().fill(INPUT).rounding(4.0).inner_margin(egui::Margin::symmetric(12.0, 6.0)).show(ui, |ui| {
                             ui.set_min_width(240.0);
-                            ui.label(RichText::new(key).strong().color(BRIGHT));
+                            ui.label(RichText::new(key).strong().family(semi()).color(BRIGHT));
                         });
                         let rec = if self.recording_key { "Stop Recording" } else { "Edit Keybind" };
                         if ui.button(rec).clicked() {
@@ -2963,7 +4017,103 @@ impl App {
                 section(ui, "Voice Processing");
                 ui.checkbox(&mut c.denoise, "Noise Suppression (removes background noise like fans and typing)");
                 ui.label(RichText::new("Echo cancellation isn't available yet: use headphones to avoid echo.").size(12.0).color(MUTED));
+
+                }
+
+                if tab == 2 {
+
+                section(ui, "Connection (Drover-style proxy)");
+                let mut px = c.proxy.clone().unwrap_or_default();
+                ui.add(egui::TextEdit::singleline(&mut px).hint_text("socks5://127.0.0.1:10808  or  http://127.0.0.1:8080").desired_width(f32::INFINITY));
+                let px = px.trim().to_string();
+                c.proxy = (!px.is_empty()).then_some(px.clone());
+                if !px.is_empty() && net::parse(&px).is_none() {
+                    ui.label(RichText::new("That isn't a valid proxy address (use socks5://host:port or http://host:port).").size(12.0).color(RED));
+                }
+                let active = net::get().map(|p| format!("{}://{}:{}", if p.socks { "socks5" } else { "http" }, p.host, p.port));
+                let wanted = net::parse(&px).map(|p| format!("{}://{}:{}", if p.socks { "socks5" } else { "http" }, p.host, p.port));
+                if active != wanted {
+                    ui.label(RichText::new("Restart Rustcord to use the new connection setting.").size(12.0).color(Color32::from_rgb(240, 178, 50)));
+                }
+                ui.label(
+                    RichText::new("Sends Discord traffic (chat, sign-in, web chat, voice setup) through the local proxy of your VPN/proxy app. Voice audio stays direct with the built-in UDP trick, like Discord Drover. Leave empty for a direct connection.")
+                        .size(12.0)
+                        .color(MUTED),
+                );
+                }
+                if tab == 0 {
+                    ui.add_space(12.0);
+                    egui::Frame::none().fill(RAIL).rounding(8.0).inner_margin(16.0).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if !self.me_avatar.is_empty() {
+                                ui.add(egui::Image::new(self.me_avatar.as_str()).fit_to_exact_size(Vec2::splat(80.0)).rounding(40.0));
+                            }
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&self.me).size(22.0).strong().family(semi()).color(BRIGHT));
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("ID {}", self.me_id)).size(12.0).color(MUTED));
+                                    if ui.small_button(icons::COPY).on_hover_text("Copy user ID").clicked() {
+                                        ui.output_mut(|o| o.copied_text = self.me_id.clone());
+                                    }
+                                });
+                                ui.label(RichText::new(format!("{} Signed in", icons::CHECK_CIRCLE)).size(13.0).color(GREEN));
+                            });
+                        });
+                    });
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Password, email, two-factor and account standing are managed in the official Discord app or website.").size(13.0).color(MUTED));
+                    if ui.button(format!("{}  Open Discord account settings", icons::ARROW_SQUARE_OUT)).clicked() {
+                        let _ = std::process::Command::new("explorer.exe").arg("https://discord.com/channels/@me").spawn();
+                    }
+                }
+                if tab == 3 {
+                    ui.add_space(8.0);
+                    let rows = [
+                        ("Quick Switcher", "Ctrl + K"),
+                        ("User Settings", "Ctrl + ,"),
+                        ("Toggle Mute", "Ctrl + Shift + M"),
+                        ("Toggle Deafen", "Ctrl + Shift + D"),
+                        ("Toggle Member List", "Ctrl + U"),
+                        ("Emoji Picker", "Ctrl + E"),
+                        ("Close popup / cancel reply", "Esc"),
+                        ("Push to Talk", if c.ptt { "see below" } else { "off (Voice Activity)" }),
+                    ];
+                    egui::Grid::new("keybinds").num_columns(2).spacing(Vec2::new(40.0, 10.0)).striped(true).show(ui, |ui| {
+                        for (what, keys) in rows {
+                            ui.label(RichText::new(what).color(TEXT));
+                            ui.label(RichText::new(keys).strong().family(semi()).color(BRIGHT));
+                            ui.end_row();
+                        }
+                        if c.ptt {
+                            ui.label(RichText::new("Push to Talk key").color(TEXT));
+                            ui.label(RichText::new(voice::key_name(c.ptt_key)).strong().family(semi()).color(BRIGHT));
+                            ui.end_row();
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Change the Push to Talk key under Voice & Video.").size(12.0).color(MUTED));
+                }
+                if tab == 4 {
+                    ui.add_space(8.0);
+                    if ui.button(format!("{}  Open logs folder", icons::FOLDER_OPEN)).clicked() {
+                        let dir = token_path().with_file_name("");
+                        let _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
+                    }
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(format!("Rustcord {}: native Rust Discord client", env!("CARGO_PKG_VERSION"))).size(12.0).color(MUTED));
+                }
+                    });
+                });
             });
+        self.settings_tab = new_tab;
+        if log_out {
+            let _ = fs::remove_file(token_path());
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if c.web_chat != before.web_chat && !c.web_chat {
+            self.webchat = None;
+            self.web_call = false;
+        }
 
         if toggle_test {
             self.mic_testing = !self.mic_testing;
@@ -2990,6 +4140,9 @@ impl App {
         let Some((user, name, pos)) = self.vol_popup.clone() else { return };
         let Ok(uid) = user.parse::<u64>() else {
             self.vol_popup = None;
+            self.profile_pop = None;
+            self.share_open = false;
+            self.join_open = false;
             if self.call_fullscreen {
                 self.call_fullscreen = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -3000,7 +4153,13 @@ impl App {
         let before = vol;
         let area = egui::Area::new(egui::Id::new("vol_popup")).fixed_pos(pos).order(egui::Order::Foreground).show(ctx, |ui| {
             egui::Frame::popup(ui.style()).fill(Color32::from_rgb(17, 18, 20)).rounding(6.0).inner_margin(10.0).show(ui, |ui| {
-                ui.label(RichText::new(&name).strong().color(BRIGHT));
+                ui.label(RichText::new(&name).strong().family(semi()).color(BRIGHT));
+                let mut muted = vol <= 0.1;
+                let mute_col = if muted { RED } else { TEXT };
+            if ui.checkbox(&mut muted, RichText::new(format!("{}  Mute (only for you)", icons::SPEAKER_SLASH)).color(mute_col)).changed() {
+                    vol = if muted { 0.0 } else { 100.0 };
+                }
+                ui.add_space(4.0);
                 ui.label(RichText::new("User Volume").size(12.0).color(MUTED));
                 ui.add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").fixed_decimals(0));
                 if ui.button("Reset to 100%").clicked() {
@@ -3021,6 +4180,9 @@ impl App {
             && ctx.input(|i| i.pointer.interact_pos()).map_or(false, |p| !area.response.rect.contains(p) && p != pos);
         if outside {
             self.vol_popup = None;
+            self.profile_pop = None;
+            self.share_open = false;
+            self.join_open = false;
             if self.call_fullscreen {
                 self.call_fullscreen = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -3144,6 +4306,7 @@ impl App {
     fn voice_tiles(&self, ui: &mut egui::Ui, channel: &str, speaking: &HashSet<String>) -> Option<(String, String)> {
         let members = self.voice_members.get(channel).map(|v| v.as_slice()).unwrap_or(&[]);
         let mut clicked = None;
+        egui::ScrollArea::vertical().id_salt(("voice_tiles", channel)).auto_shrink([false, true]).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::splat(12.0);
             for m in members {
@@ -3168,7 +4331,8 @@ impl App {
                 }
                 let vol = m.user.parse::<u64>().ok().and_then(|u| self.vcfg.lock().unwrap().user_vol.get(&u).copied());
                 if let Some(v) = vol.filter(|v| (*v - 1.0).abs() > 0.01) {
-                    p.text(rect.right_top() + Vec2::new(-10.0, 16.0), Align2::RIGHT_CENTER, format!("{} {:.0}%", icons::SPEAKER_LOW, v * 100.0), FontId::proportional(11.0), MUTED);
+                    let (icon, txt, col) = if v <= 0.001 { (icons::SPEAKER_SLASH, "Muted".to_string(), RED) } else { (icons::SPEAKER_LOW, format!("{:.0}%", v * 100.0), MUTED) };
+                    p.text(rect.right_top() + Vec2::new(-10.0, 16.0), Align2::RIGHT_CENTER, format!("{icon} {txt}"), FontId::proportional(11.0), col);
                 }
                 if m.streaming {
                     let badge = Rect::from_min_size(rect.left_top() + Vec2::new(8.0, 8.0), Vec2::new(38.0, 18.0));
@@ -3196,6 +4360,7 @@ impl App {
                 }
             }
         });
+        });
         clicked
     }
 
@@ -3209,7 +4374,7 @@ impl App {
         };
         ui.horizontal(|ui| {
             ui.label(RichText::new(icons::MONITOR).size(18.0).color(MUTED));
-            ui.label(RichText::new(format!("{who}'s Screen")).strong().size(16.0).color(BRIGHT));
+            ui.label(RichText::new(format!("{who}'s Screen")).strong().family(semi()).size(16.0).color(BRIGHT));
             let (w, h, fps) = stream::stats();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let stop = egui::Button::new(RichText::new(format!("{}  Stop Watching", icons::X)).color(TEXT)).fill(INPUT).rounding(6.0);
@@ -3218,11 +4383,11 @@ impl App {
                 }
                 ui.add_space(8.0);
                 egui::Frame::none().fill(RED).rounding(4.0).inner_margin(egui::Margin::symmetric(6.0, 2.0)).show(ui, |ui| {
-                    ui.label(RichText::new("LIVE").size(12.0).strong().color(Color32::WHITE));
+                    ui.label(RichText::new("LIVE").size(12.0).strong().family(semi()).color(Color32::WHITE));
                 });
                 if w > 0 {
                     egui::Frame::none().fill(Color32::from_rgb(30, 31, 34)).rounding(4.0).inner_margin(egui::Margin::symmetric(6.0, 2.0)).show(ui, |ui| {
-                        ui.label(RichText::new(format!("{h}p {fps:.0}FPS")).size(12.0).strong().color(BRIGHT));
+                        ui.label(RichText::new(format!("{h}p {fps:.0}FPS")).size(12.0).strong().family(semi()).color(BRIGHT));
                     });
                 }
             });
@@ -3255,6 +4420,14 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.handle_events(ctx);
+        if let Some(url) = self.webchat_req.take() {
+            if self.webchat.is_none() {
+                match webchat::WebChat::start(frame, &url) {
+                    Ok(w) => self.webchat = Some(w),
+                    Err(e) => self.status = format!("Couldn't open Discord web chat: {e}"),
+                }
+            }
+        }
         if self.web_login_req {
             self.web_login_req = false;
             match weblogin::WebLogin::start(frame, ctx) {
@@ -3280,14 +4453,32 @@ impl eframe::App for App {
         }
         if self.phase == Phase::Main {
             self.shortcuts(ctx);
-            self.main_screen(ctx);
+            if self.settings_open {
+                let in_call = self.web_call;
+                if let Some(w) = &mut self.webchat {
+                    w.hide(in_call);
+                }
+                self.settings_window(ctx);
+            } else {
+                self.main_screen(ctx);
+            }
             if self.qs_open {
                 self.quick_switcher(ctx);
             }
-            if self.settings_open {
-                self.settings_window(ctx);
+            if self.share_open {
+                self.share_picker(ctx);
+            }
+            if self.join_open {
+                self.join_window(ctx);
+            }
+            if let Some(img) = self.preview.lock().unwrap().take() {
+                match &mut self.preview_tex {
+                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                    None => self.preview_tex = Some(ctx.load_texture("my_stream", img, egui::TextureOptions::LINEAR)),
+                }
             }
             self.volume_popup(ctx);
+            self.profile_popout(ctx);
         } else {
             self.login_screen(ctx);
         }
@@ -3307,7 +4498,7 @@ fn init_log() {
         let _ = tracing_subscriber::fmt()
             .with_writer(std::sync::Mutex::new(file))
             .with_ansi(false)
-            .with_env_filter("songbird=debug,davey=info,rustcord=debug")
+            .with_env_filter("songbird=info,davey=info,rustcord=info")
             .try_init();
     }
 }

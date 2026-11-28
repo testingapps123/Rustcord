@@ -19,7 +19,8 @@ const POLL: &str = "(function(){ try { return window.__rcls ? window.__rcls.getI
 
 fn data_dir() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-    PathBuf::from(base).join("Rustcord").join("weblogin")
+    // Same saved web session as web chat: signing in once covers both.
+    PathBuf::from(base).join("Rustcord").join("webchat")
 }
 
 fn allowed(url: &str) -> bool {
@@ -48,9 +49,13 @@ pub struct WebLogin {
 
 impl WebLogin {
     pub fn start(frame: &eframe::Frame, ctx: &egui::Context) -> Result<Self, String> {
-        let _ = std::fs::remove_dir_all(data_dir()); // always start signed-out
+        // Keep the saved web session (shared with web chat); a signed-in page hands over at once.
         let mut context = WebContext::new(Some(data_dir()));
-        let view = WebViewBuilder::with_web_context(&mut context)
+        let mut builder = WebViewBuilder::with_web_context(&mut context);
+        if let Some(px) = crate::net::web_proxy() {
+            builder = builder.with_proxy_config(px);
+        }
+        let view = builder
             .with_background_color((49, 51, 56, 255))
             .with_initialization_script(KEEP_STORAGE)
             .with_url("https://discord.com/login")
@@ -102,16 +107,4 @@ impl WebLogin {
     }
 }
 
-impl Drop for WebLogin {
-    fn drop(&mut self) {
-        // Wipe the temporary browser data once the web engine has let go of it.
-        std::thread::spawn(|| {
-            for _ in 0..10 {
-                std::thread::sleep(Duration::from_secs(1));
-                if std::fs::remove_dir_all(data_dir()).is_ok() || !data_dir().exists() {
-                    break;
-                }
-            }
-        });
-    }
-}
+

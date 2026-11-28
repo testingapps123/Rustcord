@@ -38,16 +38,20 @@ impl WsStream {
     #[instrument]
     pub(crate) async fn connect(url: Url) -> Result<Self> {
         #[cfg(feature = "tungstenite")]
-        let (stream, _) = tokio_tungstenite::connect_async_with_config::<Url>(
-            url,
-            Some(
-                Config::default()
-                    .max_message_size(None)
-                    .max_frame_size(None),
-            ),
-            true,
-        )
-        .await?;
+        let ws_config = Config::default().max_message_size(None).max_frame_size(None);
+        // Rustcord: Drover-style proxy for the voice websocket.
+        #[cfg(feature = "tungstenite")]
+        let (stream, _) = match crate::video::proxy() {
+            Some(p) => {
+                let host = url.host_str().unwrap_or_default().to_string();
+                let port = url.port_or_known_default().unwrap_or(443);
+                let tcp = crate::video::proxy_connect(&p, &host, port)
+                    .await
+                    .map_err(TungsteniteError::Io)?;
+                tokio_tungstenite::client_async_tls_with_config(url, tcp, Some(ws_config), None).await?
+            },
+            None => tokio_tungstenite::connect_async_with_config::<Url>(url, Some(ws_config), true).await?,
+        };
         #[cfg(feature = "tws")]
         let (stream, _) = tokio_websockets::ClientBuilder::new()
             .limits(Limits::unlimited())

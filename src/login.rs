@@ -24,7 +24,7 @@ fn client() -> Result<reqwest::blocking::Client, String> {
     if let Some(c) = CLIENT.get() {
         return Ok(c.clone());
     }
-    let c = reqwest::blocking::Client::builder()
+    let c = crate::net::http_client()
         .user_agent(UA)
         .cookie_store(true)
         .timeout(Duration::from_secs(20))

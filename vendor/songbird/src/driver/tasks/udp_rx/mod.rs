@@ -317,6 +317,13 @@ impl UdpRx {
                 )));
             },
             DemuxedMut::Rtcp(mut rtcp) => {
+                // Rustcord: a viewer asked for a full picture (PLI) for our outgoing stream.
+                {
+                    let raw = rtcp.packet();
+                    if raw.len() >= 2 && raw[1] == 206 && (raw[0] & 0x1f) == 1 && crate::video::is_sending() {
+                        crate::video::keyframe_wanted();
+                    }
+                }
                 let packet_data = if self.config.decode_mode.should_decrypt() {
                     let out = self.cipher.decrypt_rtcp_in_place(&mut rtcp);
 

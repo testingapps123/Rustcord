@@ -12,7 +12,7 @@
 pub mod bench_internals;
 
 pub(crate) mod connection;
-mod crypto;
+pub(crate) mod crypto;
 #[cfg(feature = "receive")]
 mod decode_mode;
 mod mix_mode;

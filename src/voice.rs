@@ -54,6 +54,10 @@ pub struct VoiceCfg {
     pub denoise: bool,
     /// per-person volume, user id -> 0.0 ..= 2.0
     pub user_vol: HashMap<u64, f32>,
+    /// chat through Discord's own web app (official client) instead of Rustcord's native chat
+    pub web_chat: bool,
+    /// Drover-style proxy for Discord connections, e.g. "socks5://127.0.0.1:10808"
+    pub proxy: Option<String>,
 }
 
 impl Default for VoiceCfg {
@@ -68,6 +72,8 @@ impl Default for VoiceCfg {
             ptt_key: 0xC0, // the ` key
             denoise: true,
             user_vol: HashMap::new(),
+            web_chat: true,
+            proxy: None,
         }
     }
 }
@@ -87,6 +93,8 @@ impl VoiceCfg {
         c.ptt = v["ptt"].as_bool().unwrap_or(false);
         c.ptt_key = v["ptt_key"].as_u64().unwrap_or(0xC0) as u16;
         c.denoise = v["denoise"].as_bool().unwrap_or(true);
+        c.web_chat = true; // web chat is always on
+        c.proxy = v["proxy"].as_str().filter(|s| !s.trim().is_empty()).map(String::from);
         if let Some(m) = v["user_vol"].as_object() {
             for (k, val) in m {
                 if let (Ok(id), Some(vol)) = (k.parse::<u64>(), val.as_f64()) {
@@ -103,7 +111,7 @@ impl VoiceCfg {
         let v = serde_json::json!({
             "input_dev": self.input_dev, "output_dev": self.output_dev,
             "in_vol": self.in_vol, "out_vol": self.out_vol, "gate": self.gate,
-            "ptt": self.ptt, "ptt_key": self.ptt_key, "denoise": self.denoise,
+            "ptt": self.ptt, "ptt_key": self.ptt_key, "denoise": self.denoise, "web_chat": self.web_chat, "proxy": self.proxy,
             "user_vol": users,
         });
         let _ = std::fs::write(path, serde_json::to_string_pretty(&v).unwrap_or_default());
@@ -181,6 +189,9 @@ pub enum VoiceMsg {
     RestartAudio,
     /// settings 'Let's Check': hear your own mic
     MicTest(bool),
+    /// we asked Discord to create our stream with this key
+    GoLive { key: String },
+    StopLive,
 }
 
 pub enum VoiceUi {
@@ -192,6 +203,9 @@ pub enum VoiceUi {
     StreamConnecting,
     StreamLive,
     StreamEnded(String),
+    /// our own stream is connected (UI then un-pauses it)
+    LiveStarted,
+    LiveEnded(String),
 }
 
 /// Reports when a stream connection drops.
@@ -625,6 +639,11 @@ async fn run(
     let mut stream_rtc: Option<String> = None;
     let mut stream_server: Option<(String, String)> = None;
     let mut stream_live: Option<(Driver, u64)> = None;
+    // our own stream (going live)
+    let mut live_key: Option<String> = None;
+    let mut live_rtc: Option<String> = None;
+    let mut live_server: Option<(String, String)> = None;
+    let mut live_conn: Option<(Driver, u64)> = None;
     let shared = Shared {
         mic: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
         mic_level: Arc::new(AtomicU32::new(0)),
@@ -644,6 +663,8 @@ async fn run(
     let mut gate_open = false;
     let mut last_loud = Instant::now() - GATE_HANGOVER;
     let mut tick = tokio::time::interval(Duration::from_millis(40));
+    let mut last_confirm = Instant::now();
+    let mut join_asked: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -665,6 +686,8 @@ async fn run(
                     VoiceMsg::StreamGone(key) => tracing::info!("stream: STREAM_DELETE {key}"),
                     VoiceMsg::RestartAudio => tracing::info!("audio: devices changed"),
                     VoiceMsg::MicTest(on) => tracing::info!("audio: mic test {on}"),
+                    VoiceMsg::GoLive { key } => tracing::info!("live: requested {key}"),
+                    VoiceMsg::StopLive => tracing::info!("live: stop requested"),
                 }
                 let stop_stream = |live: &mut Option<(Driver, u64)>| {
                     if let Some((mut d, rtc)) = live.take() {
@@ -681,6 +704,7 @@ async fn run(
                         pending = Some((guild, channel));
                         session = None;
                         server = None;
+                        join_asked = Some(Instant::now());
                         ui(&out, &ctx, VoiceUi::Connecting);
                     }
                     VoiceMsg::Leave => {
@@ -742,6 +766,31 @@ async fn run(
                         want_stream = None;
                         ui(&out, &ctx, VoiceUi::StreamEnded(String::new()));
                     }
+                    VoiceMsg::GoLive { key } => {
+                        stop_stream(&mut live_conn);
+                        live_key = Some(key);
+                        live_rtc = None;
+                        live_server = None;
+                    }
+                    VoiceMsg::StopLive => {
+                        stop_stream(&mut live_conn);
+                        live_key = None;
+                        songbird::video::set_sending(false, 0, 0, 0, 0);
+                    }
+                    VoiceMsg::StreamCreate { key, rtc_server_id } if live_key.as_deref() == Some(key.as_str()) => {
+                        live_rtc = Some(rtc_server_id);
+                    }
+                    VoiceMsg::StreamServer { key, endpoint, token } if live_key.as_deref() == Some(key.as_str()) => {
+                        if let Some(ep) = endpoint {
+                            live_server = Some((ep, token));
+                        }
+                    }
+                    VoiceMsg::StreamGone(key) if live_key.as_deref() == Some(key.as_str()) => {
+                        stop_stream(&mut live_conn);
+                        live_key = None;
+                        songbird::video::set_sending(false, 0, 0, 0, 0);
+                        ui(&out, &ctx, VoiceUi::LiveEnded("Your stream ended".into()));
+                    }
                     VoiceMsg::StreamCreate { key, rtc_server_id } => {
                         if want_stream.as_ref().map_or(false, |w| w.0 == key) {
                             stream_rtc = Some(rtc_server_id);
@@ -757,6 +806,29 @@ async fn run(
                             stop_stream(&mut stream_live);
                             want_stream = None;
                             ui(&out, &ctx, VoiceUi::StreamEnded("The stream ended".into()));
+                        }
+                    }
+                }
+
+                // Everything needed to go live has arrived?
+                if live_conn.is_none() {
+                    if let (Some(_), Some(rtc), Some((ep, token)), Some(sid), Some(uid)) =
+                        (live_key.as_ref(), live_rtc.clone(), live_server.clone(), gw_session.clone(), me.clone())
+                    {
+                        live_server = None;
+                        tracing::info!("live: connecting to {ep}");
+                        match connect_stream(&out, &ctx, &rtc, ep, token, sid, &uid).await {
+                            Ok(c) => {
+                                tracing::info!("live: connected");
+                                live_conn = Some(c);
+                                ui(&out, &ctx, VoiceUi::LiveStarted);
+                            }
+                            Err(e) => {
+                                tracing::warn!("live: connect failed: {e}");
+                                live_key = None;
+                                songbird::video::set_sending(false, 0, 0, 0, 0);
+                                ui(&out, &ctx, VoiceUi::LiveEnded(format!("Couldn't go live: {e}")));
+                            }
                         }
                     }
                 }
@@ -788,6 +860,7 @@ async fn run(
                     (pending.clone(), session.clone(), server.clone(), me.clone())
                 {
                     pending = None;
+                    join_asked = None;
                     tracing::info!("voice: have session + server, connecting to {endpoint}");
                     mic_test = None;
                     match tokio::time::timeout(Duration::from_secs(20), connect(&shared, &out, &ctx, guild, channel, sid, token, endpoint, uid)).await {
@@ -812,6 +885,13 @@ async fn run(
                 }
             }
             _ = tick.tick() => {
+                // Discord silently ignores a join it won't allow (channel full, no permission).
+                if pending.is_some() && join_asked.map_or(false, |t| t.elapsed() >= Duration::from_secs(10)) {
+                    tracing::warn!("voice: Discord never answered the join (session={}, server={})", session.is_some(), server.is_some());
+                    pending = None;
+                    join_asked = None;
+                    ui(&out, &ctx, VoiceUi::Ended("Discord didn't let you join this channel. It may be full, or you may not have permission to connect.".into()));
+                }
                 if let Some(t) = &mic_test {
                     // Mic test: play your own (processed) mic straight back.
                     let mut mic = shared.mic.0.lock().unwrap();
@@ -828,6 +908,11 @@ async fn run(
                     }
                 }
                 let Some(l) = live.as_mut() else { continue };
+                // Safety net: keep the screen in sync ("Voice Connected") while the connection is up.
+                if last_confirm.elapsed() >= Duration::from_secs(3) {
+                    last_confirm = Instant::now();
+                    ui(&out, &ctx, VoiceUi::Connected);
+                }
                 let level = f32::from_bits(shared.mic_level.swap(0, Ordering::Relaxed));
                 let (ptt, key, gate) = {
                     let c = shared.cfg.lock().unwrap();

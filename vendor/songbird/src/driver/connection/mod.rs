@@ -269,6 +269,29 @@ impl Connection {
 
         let ssrc = ready.ssrc;
 
+        // Rustcord: going live. Announce our video stream, then start the frame sender
+        // on this connection's socket (Discord gives the video SSRC = audio SSRC + 1).
+        if is_stream && crate::video::is_sending() {
+            let (w, h, fps) = crate::video::send_format();
+            info!("[rustcord] go live: announcing {w}x{h}@{fps} video");
+            client
+                .send_value(&serde_json::json!({ "op": 5, "d": { "speaking": 0, "delay": 0, "ssrc": ssrc } }))
+                .await?;
+            client
+                .send_value(&serde_json::json!({ "op": 12, "d": {
+                    "audio_ssrc": ssrc, "video_ssrc": ssrc + 1, "rtx_ssrc": ssrc + 2,
+                    "streams": [{
+                        "type": "video", "rid": "100", "ssrc": ssrc + 1, "active": true, "quality": 100,
+                        "rtx_ssrc": ssrc + 2, "max_bitrate": crate::video::send_bitrate(), "max_framerate": fps,
+                        "max_resolution": { "type": "fixed", "width": w, "height": h },
+                    }],
+                }}))
+                .await?;
+            if let Ok(sock) = udp_tx.try_clone() {
+                crate::video::start_sender(sock, cipher.clone(), ssrc + 1, dave_session.clone());
+            }
+        }
+
         let mix_conn = MixerConnection {
             #[cfg(feature = "receive")]
             cipher: cipher.clone(),
