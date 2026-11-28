@@ -36,6 +36,11 @@ cargo build --release
 If the project path is very long or inside a Temp folder, set a short `CARGO_TARGET_DIR` and
 `TrackFileAccess=false` before building (libopus is built with CMake/MSBuild).
 
+## Status
+everything works except the messages when you send a message discord flagges your account working on it including the file attachment for sending files still working on it
+
+
+
 ## Notes
 
 - `vendor/songbird` is a patched copy of songbird 0.6.1 (ISC licence, see its `LICENSE.md`):
