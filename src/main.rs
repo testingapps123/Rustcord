@@ -4671,6 +4671,28 @@ impl eframe::App for App {
 
 /// Write a log to %LOCALAPPDATA%\Rustcord\log.txt (voice steps + songbird's own messages).
 /// Tokens are never written: only ids, endpoints and states.
+/// Only one Rustcord at a time: two copies would both sign in to Discord as you (voice and
+/// streams go to one of them at random) and fight over the log. Starting it again just brings
+/// the open window to the front. Returns false if another copy is already running.
+fn single_instance() -> bool {
+    use windows::core::w;
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+    unsafe {
+        // Kept open for the whole run (never closed): Windows frees it when we exit.
+        let _mutex = CreateMutexW(None, false, w!("Local\\Rustcord.SingleInstance"));
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            if let Ok(hwnd) = FindWindowW(None, w!("Rustcord")) {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                let _ = SetForegroundWindow(hwnd);
+            }
+            return false;
+        }
+    }
+    true
+}
+
 fn init_log() {
     let p = token_path().with_file_name("log.txt");
     if let Some(dir) = p.parent() {
@@ -4678,7 +4700,9 @@ fn init_log() {
     }
     // Keep the previous run's log so a restart doesn't wipe a test.
     let _ = fs::rename(&p, p.with_file_name("log-prev.txt"));
-    if let Ok(file) = fs::File::create(&p) {
+    // If log.txt is somehow locked, still log (to a separate file) rather than not at all.
+    let file = fs::File::create(&p).or_else(|_| fs::File::create(p.with_file_name(format!("log-{}.txt", std::process::id()))));
+    if let Ok(file) = file {
         let _ = tracing_subscriber::fmt()
             .with_writer(std::sync::Mutex::new(file))
             .with_ansi(false)
@@ -4688,6 +4712,9 @@ fn init_log() {
 }
 
 fn main() -> eframe::Result<()> {
+    if !single_instance() {
+        return Ok(()); // already running: its window was brought to the front
+    }
     init_log();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

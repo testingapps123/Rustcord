@@ -275,12 +275,18 @@ impl AuxNetwork {
                 )));
             },
             GatewayEvent::ClientConnect(ev) => {
-                // [rustcord] op 12: this user's camera video SSRC (0 = camera off).
+                // [rustcord] op 12 on the VOICE connection: this user's camera SSRC (0 = off).
+                // On a stream connection the same message describes the screen share itself,
+                // which must stay with the stream viewer (not be treated as a camera).
                 debug!("[rustcord] video state: {:?}", ev);
-                crate::video::set_camera(ev.user_id.0, ev.video_ssrc);
+                if !crate::video::is_stream_server(self.info.guild_id.0.get()) {
+                    crate::video::set_camera(ev.user_id.0, ev.video_ssrc);
+                }
             },
             GatewayEvent::ClientDisconnect(ev) => {
-                crate::video::remove_camera_user(ev.user_id.0);
+                if !crate::video::is_stream_server(self.info.guild_id.0.get()) {
+                    crate::video::remove_camera_user(ev.user_id.0);
+                }
                 #[cfg(feature = "receive")]
                 {
                     self.ssrc_signalling.disconnected_users.insert(ev.user_id);

@@ -39,7 +39,7 @@ unicode-bidi = "0.3.18"
 ab_glyph = "0.2"
 unicode-segmentation = "1.13.3"
 emojis = "0.9.1"
-windows = { version = "0.58", features = ["implement", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_Media_MediaFoundation"] }
+windows = { version = "0.58", features = ["implement", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_Media_MediaFoundation", "Win32_UI_WindowsAndMessaging"] }
 windows-core = "0.58"
 
 # Local songbird copy with a Drover-style voice tweak (see vendor/songbird/src/driver/connection/mod.rs).
